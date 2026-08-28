@@ -91,6 +91,19 @@ class ValidationEngine:
         canonical_str = json.dumps(request_data, sort_keys=True, separators=(",", ":"))
         return len(canonical_str.encode("utf-8"))
 
+    def _match_indicator_detail(self, ind: Any, detail: str) -> bool:
+        """Checks if a SecurityIndicator matches the specified detail string pattern."""
+        if ind.category == "subprocess":
+            return detail == f"Subprocess call: {ind.evidence}"
+        elif ind.category == "database":
+            return detail == f"Database indicator: {ind.evidence}"
+        elif ind.category == "serialization":
+            return detail == f"Serialization call: {ind.evidence}"
+        elif ind.category in ("cloud_sdk", "secret_config"):
+            return detail == f"Cloud/Secrets indicator: {ind.evidence}"
+        else:
+            return detail == f"Security indicator: {ind.evidence}"
+
     def _resolve_and_validate_evidence(self, ref: EvidenceReference, report: RepositoryReport) -> Tuple[bool, str]:
         """Resolves untrusted evidence reference against authoritative report findings."""
         if not isinstance(ref, EvidenceReference):
@@ -109,20 +122,8 @@ class ValidationEngine:
         if ref.type == "security_indicator":
             for ind in report.security_indicators:
                 if ind.file == ref.file and (ind.line == ref.line or (ind.line is None and ref.line is None)):
-                    expected_detail = ""
-                    if ind.category == "subprocess":
-                        expected_detail = f"Subprocess call: {ind.evidence}"
-                    elif ind.category == "database":
-                        expected_detail = f"Database indicator: {ind.evidence}"
-                    elif ind.category == "serialization":
-                        expected_detail = f"Serialization call: {ind.evidence}"
-                    elif ind.category in ("cloud_sdk", "secret_config"):
-                        expected_detail = f"Cloud/Secrets indicator: {ind.evidence}"
-                    else:
-                        expected_detail = f"Security indicator: {ind.evidence}"
-
-                    if ref.detail == expected_detail:
-                        return True, expected_detail
+                    if self._match_indicator_detail(ind, ref.detail):
+                        return True, ref.detail
             return False, ""
         elif ref.type == "route":
             for r in report.routes:
@@ -200,18 +201,18 @@ class ValidationEngine:
             ind_ref = next((r for r in canonical_references if r.type == "security_indicator"), None)
             ind = None
             if ind_ref:
-                # Select correct indicator matching same file, line, and evidence detail pattern
-                ind = next((
+                # Find all indicators matching file, line, and the detail pattern
+                matching_inds = [
                     i for i in report.security_indicators
                     if i.file == ind_ref.file
                     and (i.line == ind_ref.line or (i.line is None and ind_ref.line is None))
-                    and ind_ref.detail in (
-                        f"Subprocess call: {i.evidence}",
-                        f"Database indicator: {i.evidence}",
-                        f"Serialization call: {i.evidence}",
-                        f"Cloud/Secrets indicator: {i.evidence}"
-                    )
-                ), None)
+                    and self._match_indicator_detail(i, ind_ref.detail)
+                ]
+                if len(matching_inds) == 1:
+                    ind = matching_inds[0]
+                elif len(matching_inds) > 1:
+                    # Ambiguous match -> fail closed
+                    return False
 
             if hypothesis.category == "command_injection":
                 route_ref = next((r for r in canonical_references if r.type == "route"), None)

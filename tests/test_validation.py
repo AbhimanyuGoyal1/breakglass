@@ -22,9 +22,11 @@ class SleepValidator(SandboxValidator):
     """Validator that sleeps to simulate latency/hangs."""
     def __init__(self, sleep_seconds: float):
         self.sleep_seconds = sleep_seconds
+        self.completed = False
 
     def validate(self, hypothesis, context):
         time.sleep(self.sleep_seconds)
+        self.completed = True
         return ValidationResult(
             hypothesis_id=hypothesis.id or "",
             status=ValidationStatus.VALIDATED,
@@ -431,6 +433,7 @@ class TestSandboxValidation(unittest.TestCase):
         self.assertEqual(results[0].status, ValidationStatus.TIMEOUT)
         # Ensure it returns within 0.5s (meaning it did not wait for the full 2.0s sleep validator to finish)
         self.assertTrue(elapsed < 0.5, f"Orchestrator hung for {elapsed} seconds")
+        self.assertFalse(validator.completed, "Validator thread was prematurely terminated or blocked orchestrator")
 
     def test_deterministic_reauthentication_extra_evidence(self):
         """Verify that extra, missing, duplicate, or altered evidence references are strictly rejected."""
@@ -681,6 +684,92 @@ class TestSandboxValidation(unittest.TestCase):
         self.assertFalse(r.confirmed)
         self.assertIn("Missing TRUEFORGE_API_KEY", r.error_message)
 
+
+    def test_duplicate_same_location_indicator_substitution(self):
+        """Verify that substituting one same-location indicator for another fails authentication."""
+        report_dup = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[
+                RouteCandidate(file="src/server.py", line=12, method="POST", pattern="/run", evidence="")
+            ],
+            security_indicators=[
+                SecurityIndicator(
+                    category="subprocess",
+                    indicator_type="subprocess_execution_indicator",
+                    file="src/server.py",
+                    line=15,
+                    evidence="subprocess.run"
+                ),
+                SecurityIndicator(
+                    category="database",
+                    indicator_type="raw_sql_construction_indicator",
+                    file="src/server.py",
+                    line=15,
+                    evidence="SELECT id FROM users"
+                )
+            ]
+        )
+        det_engine = DeterministicReasoningEngine()
+        det_report = det_engine.generate_hypotheses(report_dup)
+        self.assertEqual(len(det_report.hypotheses), 2)
+
+        # Let's get the database/SQL Injection hypothesis
+        sql_hyp = next(h for h in det_report.hypotheses if h.category == "sql_injection")
+
+        # Substitute the evidence reference detail to match the subprocess indicator's detail
+        import copy
+        modified_references = copy.deepcopy(sql_hyp.evidence_references)
+        # Find the indicator reference and change its detail to the subprocess one
+        for ref in modified_references:
+            if ref.type == "security_indicator":
+                ref.detail = "Subprocess call: subprocess.run"
+
+        bad_hyp = SecurityHypothesis(
+            id=sql_hyp.id,
+            title=sql_hyp.title,
+            description=sql_hyp.description,
+            category=sql_hyp.category,
+            severity=sql_hyp.severity,
+            confidence=sql_hyp.confidence,
+            evidence_references=modified_references,
+            rationale=sql_hyp.rationale
+        )
+
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        eligible, reason = engine.check_eligibility(bad_hyp, report_dup)
+        self.assertFalse(eligible, "Substituting same-location indicator should have failed authentication")
+
+    def test_generic_fallback_indicator_authentication(self):
+        """Verify that fallback/generic indicators resolve and authenticate cleanly."""
+        report_fallback = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[
+                RouteCandidate(file="src/server.py", line=12, method="POST", pattern="/run", evidence="")
+            ],
+            security_indicators=[
+                SecurityIndicator(
+                    category="unknown_or_custom",
+                    indicator_type="custom_indicator",
+                    file="src/server.py",
+                    line=15,
+                    evidence="custom_unsafe_func"
+                )
+            ]
+        )
+
+        ref = EvidenceReference(
+            type="security_indicator",
+            file="src/server.py",
+            line=15,
+            detail="Security indicator: custom_unsafe_func"
+        )
+
+        engine = ValidationEngine(MockSandboxValidator())
+        valid, resolved_detail = engine._resolve_and_validate_evidence(ref, report_fallback)
+        self.assertTrue(valid)
+        self.assertEqual(resolved_detail, "Security indicator: custom_unsafe_func")
 
 if __name__ == "__main__":
     unittest.main()
