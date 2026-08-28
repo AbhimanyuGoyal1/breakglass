@@ -115,20 +115,39 @@ def parse_manifest_file(file_path: Path, rel_path_str: str) -> Optional[Manifest
             )
         elif name == "pyproject.toml":
             content = file_path.read_text(encoding="utf-8", errors="ignore")
-            # Primitive regex parsing to avoid needing toml library dependency
             deps = []
-            in_deps = False
-            for line in content.splitlines():
-                if "dependencies" in line:
-                    in_deps = True
-                    continue
-                if in_deps:
-                    if line.startswith("["):
-                        in_deps = False
+            try:
+                import tomllib
+                data = tomllib.loads(content)
+                # PEP 621 [project] dependencies
+                proj_deps = data.get("project", {}).get("dependencies", [])
+                for d in proj_deps:
+                    pkg = re.split(r"[=<>;~\s\[]", d)[0].strip()
+                    if pkg:
+                        deps.append(pkg)
+                # Poetry [tool.poetry.dependencies]
+                poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
+                for k in poetry_deps.keys():
+                    if k.lower() != "python":
+                        deps.append(k)
+            except Exception:
+                # Fallback parsing
+                in_deps = False
+                for line in content.splitlines():
+                    if "dependencies" in line:
+                        in_deps = True
                         continue
-                    m = re.match(r"""^\s*["']?([a-zA-Z0-9_\-]+)["']?\s*=""", line)
-                    if m:
-                        deps.append(m.group(1))
+                    if in_deps:
+                        if line.startswith("["):
+                            in_deps = False
+                            continue
+                        m = re.match(r"""^\s*["']?([a-zA-Z0-9_\-]+)["']?\s*=""", line)
+                        if m:
+                            deps.append(m.group(1))
+                        else:
+                            m_arr = re.match(r"""^\s*["']([a-zA-Z0-9_\-]+).*?["']""", line)
+                            if m_arr:
+                                deps.append(m_arr.group(1))
             return ManifestInfo(
                 ecosystem="pip/poetry/flit",
                 file=rel_path_str,
@@ -157,12 +176,27 @@ def parse_manifest_file(file_path: Path, rel_path_str: str) -> Optional[Manifest
         elif name == "go.mod":
             content = file_path.read_text(encoding="utf-8", errors="ignore")
             deps = []
+            in_require_block = False
             for line in content.splitlines():
                 line = line.strip()
-                if line and not line.startswith("//") and not line.startswith("module") and not line.startswith("go "):
+                if not line or line.startswith("//"):
+                    continue
+                if line.startswith("replace") or line.startswith("exclude"):
+                    continue
+                if line == "require (":
+                    in_require_block = True
+                    continue
+                if in_require_block:
+                    if line == ")":
+                        in_require_block = False
+                        continue
                     parts = line.split()
-                    if len(parts) >= 1 and "/" in parts[0]:
+                    if parts and "/" in parts[0]:
                         deps.append(parts[0])
+                elif line.startswith("require "):
+                    parts = line.split()
+                    if len(parts) >= 2 and "/" in parts[1]:
+                        deps.append(parts[1])
             return ManifestInfo(
                 ecosystem="go",
                 file=rel_path_str,
@@ -174,14 +208,15 @@ def parse_manifest_file(file_path: Path, rel_path_str: str) -> Optional[Manifest
 
 
 def detect_frameworks_from_manifests(manifests: List[ManifestInfo]) -> List[str]:
-    """Detects framework names from parsed manifest dependencies."""
+    """Detects framework names from parsed manifest dependencies strictly without false positives."""
     detected = set()
     for manifest in manifests:
         all_deps = manifest.dependencies + manifest.dev_dependencies
         for dep in all_deps:
             dep_lower = dep.lower()
             for key, framework in FRAMEWORK_INDICATORS.items():
-                if key in dep_lower:
+                # Strict identifier comparison (exact match or module path prefix)
+                if dep_lower == key or dep_lower.startswith(key + "/") or dep_lower.startswith(key + "-"):
                     detected.add(framework)
     return sorted(list(detected))
 
@@ -200,8 +235,8 @@ def check_is_config_or_infra(rel_path_str: str) -> Dict[str, bool]:
     if "dockerfile" in filename or "containerfile" in filename or filename in ("docker-compose.yml", "docker-compose.yaml", ".dockerignore"):
         is_docker = True
 
-    # CI/CD
-    if ".github/workflows" in path_lower or ".gitlab-ci.yml" in filename or filename in ("jenkinsfile", ".travis.yml", "bitbucket-pipelines.yml", ".circleci/config.yml"):
+    # CI/CD - use path_lower for directory-qualified configs like .circleci/config.yml
+    if ".github/workflows" in path_lower or ".gitlab-ci.yml" in filename or ".circleci/config.yml" in path_lower or filename in ("jenkinsfile", ".travis.yml", "bitbucket-pipelines.yml"):
         is_cicd = True
 
     # Infrastructure

@@ -30,7 +30,7 @@ INDICATOR_PATTERNS: List[IndicatorPattern] = [
     IndicatorPattern(
         category="subprocess",
         indicator_type="subprocess_execution_indicator",
-        pattern=r"\b(subprocess\.(Popen|run|call|check_output|check_call)|os\.(system|popen|exec[l|v]e?)|child_process\.(exec|spawn|execSync|spawnSync)|Runtime\.getRuntime\(\)\.exec|ProcessBuilder|exec\.Command|system\(|passthru\(|shell_exec\()\b",
+        pattern=r"\b(subprocess\.(Popen|run|call|check_output|check_call)|os\.(system|popen|exec[l|v]e?)|child_process\.(exec|spawn|execSync|spawnSync)|Runtime\.getRuntime\(\)\.exec|ProcessBuilder|exec\.Command|(system|passthru|shell_exec|exec)\s*\()",
         confidence=0.9
     ),
 
@@ -68,7 +68,7 @@ INDICATOR_PATTERNS: List[IndicatorPattern] = [
     IndicatorPattern(
         category="filesystem",
         indicator_type="filesystem_access_indicator",
-        pattern=r"\b(open\s*\(|readFile|writeFile|createReadStream|createWriteStream|fs\.(read|write|unlink|mkdir|rmdir|chmod)|FileInputStream|FileOutputStream|File\.read|File\.write)\b",
+        pattern=r"\b(open\s*\(|readFile|writeFile|createReadStream|createWriteStream|fs\.(read|write|unlink|mkdir|rmdir|chmod)|FileInputStream|FileOutputStream|File\.read|File\.write)",
         confidence=0.7
     ),
 
@@ -84,7 +84,7 @@ INDICATOR_PATTERNS: List[IndicatorPattern] = [
     IndicatorPattern(
         category="serialization",
         indicator_type="unsafe_deserialization_indicator",
-        pattern=r"\b(pickle\.loads?|yaml\.unsafe_load|yaml\.load\([^,)]*\)|eval\s*\(|exec\s*\(|marshal\.loads?|ObjectInputStream|unserialize\s*\(|JSON\.parse\s*\([^)]*eval)\b",
+        pattern=r"\b(pickle\.loads?|yaml\.unsafe_load|yaml\.load\([^,)]*\)|eval\s*\(|exec\s*\(|marshal\.loads?|ObjectInputStream|unserialize\s*\(|JSON\.parse\s*\([^)]*eval)",
         confidence=0.9
     ),
 
@@ -100,7 +100,7 @@ INDICATOR_PATTERNS: List[IndicatorPattern] = [
     IndicatorPattern(
         category="network",
         indicator_type="outbound_http_indicator",
-        pattern=r"\b(requests\.(get|post|put|delete|patch|head|request)|http\.Get|http\.Post|fetch\s*\(|axios\.(get|post|request)|urllib\.request|HttpClient|cURL|Got\.(get|post)|restTemplate)\b",
+        pattern=r"\b(requests\.(get|post|put|delete|patch|head|request)|http\.Get|http\.Post|fetch\s*\(|axios\.(get|post|request)|urllib\.request|HttpClient|cURL|Got\.(get|post)|restTemplate)",
         confidence=0.75
     ),
 
@@ -127,8 +127,8 @@ ROUTE_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"""@(app|router|api|blueprint|bp)\.(get|post|put|delete|patch|options|head|route)\s*\(\s*['"]([^'"]+)['"]""", re.IGNORECASE), "python_decorator"),
     # Express / Node.js app.get('/route', ...) / router.post(...)
     (re.compile(r"""\b(app|router)\.(get|post|put|delete|patch|options|head|all|use)\s*\(\s*['"]([^'"]+)['"]""", re.IGNORECASE), "node_express"),
-    # Go (Gin, Echo, Chi, Gorilla, net/http)
-    (re.compile(r"""\b(r|router|e|app|api|engine|group|http)\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|HandleFunc|Handle)\s*\(\s*['"]([^'"]+)['"]""", re.IGNORECASE), "go_web"),
+    # Go (Gin, Echo, Chi, Gorilla, net/http) - supports arbitrary Go receiver identifiers
+    (re.compile(r"""\b([a-zA-Z_][a-zA-Z0-9_]*)\.(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|HandleFunc|Handle)\s*\(\s*['"]([^'"]+)['"]""", re.IGNORECASE), "go_web"),
     # Java Spring (@GetMapping("/route"), @RequestMapping(...))
     (re.compile(r"""@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping|RequestMapping)\s*\(\s*(value\s*=\s*)?['"]([^'"]+)['"]""", re.IGNORECASE), "java_spring"),
     # Ruby Rails / Sinatra (get '/route', post '/route')
@@ -200,7 +200,10 @@ def scan_line_for_routes(
                 pattern = groups[2]
             elif framework == "java_spring":
                 annotation = groups[0]
-                method = annotation.replace("Mapping", "").replace("@", "").upper() if "Mapping" in annotation else "ALL"
+                if annotation.lower() in ("requestmapping", "@requestmapping"):
+                    method = "ALL"
+                else:
+                    method = annotation.replace("Mapping", "").replace("@", "").upper()
                 pattern = groups[2]
             elif framework == "ruby_route":
                 method = groups[0].upper()

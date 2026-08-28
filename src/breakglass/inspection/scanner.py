@@ -64,48 +64,83 @@ def _is_binary_file(file_path: Path) -> bool:
     return False
 
 
-def _parse_gitignore(repo_root: Path) -> List[str]:
-    """Parses .gitignore patterns if present in the repository root."""
-    gitignore_path = repo_root / ".gitignore"
-    patterns: List[str] = []
-    if gitignore_path.exists() and gitignore_path.is_file():
-        try:
-            content = gitignore_path.read_text(encoding="utf-8", errors="ignore")
-            for line in content.splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    # Normalize pattern
-                    patterns.append(line)
-        except Exception:
-            pass
-    return patterns
+class GitIgnoreRule:
+    """Represents a single parsed .gitignore pattern rule."""
+    def __init__(self, pattern: str, base_dir: str):
+        self.raw_pattern = pattern
+        self.base_dir = base_dir.replace("\\", "/").strip("/")
 
+        rule_str = pattern.strip()
+        self.is_negation = rule_str.startswith("!")
+        if self.is_negation:
+            rule_str = rule_str[1:]
 
-def _is_ignored_by_gitignore(rel_path_str: str, gitignore_patterns: List[str]) -> bool:
-    """Checks whether a relative file path matches any .gitignore pattern strictly."""
-    rel_path_normalized = rel_path_str.replace("\\", "/")
-    parts = rel_path_normalized.split("/")
+        self.is_dir_only = rule_str.endswith("/")
+        rule_str = rule_str.rstrip("/")
 
-    for pattern in gitignore_patterns:
-        pattern = pattern.strip()
-        if not pattern or pattern.startswith("#"):
-            continue
+        self.is_rooted = rule_str.startswith("/")
+        if self.is_rooted:
+            rule_str = rule_str[1:]
 
-        clean_pattern = pattern.rstrip("/")
+        self.clean_pattern = rule_str
 
-        # Rooted pattern starting with /
-        if clean_pattern.startswith("/"):
-            root_pattern = clean_pattern[1:]
-            if fnmatch.fnmatch(rel_path_normalized, root_pattern) or fnmatch.fnmatch(rel_path_normalized, f"{root_pattern}/*"):
+    def matches(self, rel_path_str: str, is_dir: bool = False) -> bool:
+        norm_path = rel_path_str.replace("\\", "/")
+
+        if self.base_dir:
+            if not (norm_path == self.base_dir or norm_path.startswith(self.base_dir + "/")):
+                return False
+            path_in_base = norm_path[len(self.base_dir):].lstrip("/")
+        else:
+            path_in_base = norm_path
+
+        if self.is_dir_only and not is_dir:
+            return False
+
+        parts = path_in_base.split("/")
+
+        if self.is_rooted or "/" in self.clean_pattern:
+            if fnmatch.fnmatch(path_in_base, self.clean_pattern) or fnmatch.fnmatch(path_in_base, f"{self.clean_pattern}/*"):
                 return True
         else:
-            # Check full relative path or any individual directory/file component
-            if fnmatch.fnmatch(rel_path_normalized, clean_pattern):
+            if fnmatch.fnmatch(path_in_base, self.clean_pattern):
                 return True
             for part in parts:
-                if fnmatch.fnmatch(part, clean_pattern):
+                if fnmatch.fnmatch(part, self.clean_pattern):
                     return True
-    return False
+        return False
+
+
+def _collect_gitignore_rules(repo_root: Path) -> List[GitIgnoreRule]:
+    """Collects all .gitignore rules across the repository hierarchy in top-down order."""
+    all_rules: List[GitIgnoreRule] = []
+
+    for root, dirs, files in os.walk(repo_root, followlinks=False):
+        dirs.sort()
+        current_dir = Path(root)
+        if ".gitignore" in files:
+            gitignore_file = current_dir / ".gitignore"
+            try:
+                rel_base = str(current_dir.relative_to(repo_root)).replace("\\", "/")
+                if rel_base == ".":
+                    rel_base = ""
+                content = gitignore_file.read_text(encoding="utf-8", errors="ignore")
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        all_rules.append(GitIgnoreRule(line, rel_base))
+            except Exception:
+                pass
+    return all_rules
+
+
+def _is_path_ignored(rel_path_str: str, rules: List[GitIgnoreRule], is_dir: bool = False) -> bool:
+    """Evaluates ignore status against ordered gitignore rules, handling negations."""
+    ignored = False
+    for rule in rules:
+        if rule.matches(rel_path_str, is_dir=is_dir):
+            ignored = not rule.is_negation
+    return ignored
 
 
 def inspect_repository(repository_path: str) -> RepositoryReport:
@@ -130,7 +165,7 @@ def inspect_repository(repository_path: str) -> RepositoryReport:
     repo_root = path_obj
     repo_root_str = str(repo_root)
 
-    gitignore_patterns = _parse_gitignore(repo_root)
+    gitignore_rules = _collect_gitignore_rules(repo_root)
 
     total_files = 0
     total_directories = 0
@@ -195,7 +230,7 @@ def inspect_repository(repository_path: str) -> RepositoryReport:
                     )
                     continue
 
-            if d in DEFAULT_IGNORED_DIRS or _is_ignored_by_gitignore(rel_dir_str, gitignore_patterns):
+            if d in DEFAULT_IGNORED_DIRS or _is_path_ignored(rel_dir_str, gitignore_rules, is_dir=True):
                 continue
 
             valid_dirs.append(d)
@@ -247,7 +282,7 @@ def inspect_repository(repository_path: str) -> RepositoryReport:
                     continue
 
             # Gitignore check
-            if _is_ignored_by_gitignore(rel_path_str, gitignore_patterns):
+            if _is_path_ignored(rel_path_str, gitignore_rules, is_dir=False):
                 continue
 
             total_files += 1
@@ -273,7 +308,7 @@ def inspect_repository(repository_path: str) -> RepositoryReport:
             rel_lower = rel_path_str.lower()
             if (
                 filename_lower.startswith("test_")
-                or filename_lower.endswith(("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts", "_test.go", "test.rs", "Test.java"))
+                or filename_lower.endswith(("_test.py", ".test.js", ".test.ts", ".spec.js", ".spec.ts", "_test.go", "test.rs", "test.java"))
                 or "/tests/" in rel_lower
                 or "/test/" in rel_lower
                 or "/__tests__/" in rel_lower
