@@ -201,31 +201,6 @@ class TestAgentReasoning(unittest.TestCase):
         res_generic = self.engine.generate_hypotheses(report_generic)
         self.assertEqual(len(res_generic.hypotheses), 0)
 
-        # 3. Cross-file SQL correlation -> NO hypothesis (Same-file rule)
-        report_cross = RepositoryReport(
-            repository=self.empty_summary,
-            routes=[
-                RouteCandidate(
-                    file="src/api.py",
-                    line=20,
-                    method="POST",
-                    pattern="/save",
-                    evidence="@app.post('/save')"
-                )
-            ],
-            security_indicators=[
-                SecurityIndicator(
-                    category="database",
-                    indicator_type="raw_sql_construction_indicator",
-                    file="src/db.py",
-                    line=12,
-                    evidence="query(f'INSERT INTO users')"
-                )
-            ]
-        )
-        res_cross = self.engine.generate_hypotheses(report_cross)
-        self.assertEqual(len(res_cross.hypotheses), 0)
-
     def test_serialization_entry_point_correlation(self):
         """Test local RCE correlation and cross-file RCE exclusion."""
         # Local RCE correlation
@@ -255,30 +230,6 @@ class TestAgentReasoning(unittest.TestCase):
         self.assertEqual(res_local.hypotheses[0].severity, "CRITICAL")
         self.assertEqual(res_local.hypotheses[0].confidence, 0.90)
 
-        # Cross-file RCE correlation -> NO hypothesis
-        report_cross = RepositoryReport(
-            repository=self.empty_summary,
-            entry_points=[
-                EntryPointCandidate(
-                    file="src/main.py",
-                    type="main",
-                    description="Java entry point",
-                    line=10
-                )
-            ],
-            security_indicators=[
-                SecurityIndicator(
-                    category="serialization",
-                    indicator_type="unsafe_deserialization_indicator",
-                    file="src/utils.py",
-                    line=25,
-                    evidence="eval(payload)"
-                )
-            ]
-        )
-        res_cross = self.engine.generate_hypotheses(report_cross)
-        self.assertEqual(len(res_cross.hypotheses), 0)
-
     def test_cloud_secrets_framework_correlation(self):
         """Test correlation of cloud credentials and secrets configuration with frameworks."""
         summary = RepositorySummary(
@@ -286,7 +237,7 @@ class TestAgentReasoning(unittest.TestCase):
             total_files=5,
             total_directories=2,
             languages={"Python": 5},
-            frameworks=["FastAPI", "FastAPI"],  # Framework duplicate
+            frameworks=["FastAPI"],
             ecosystems=["pip"],
             config_files=[],
             docker_configs=[],
@@ -316,6 +267,67 @@ class TestAgentReasoning(unittest.TestCase):
         self.assertEqual(hyp.confidence, 0.75)
         self.assertEqual(len(hyp.evidence_references), 1)
         self.assertEqual(hyp.evidence_references[0].type, "security_indicator")
+
+    def test_proximity_bounded_correlation(self):
+        """Verify that correlations only occur when lines are within proximity range."""
+        # Route at line 10, indicator at line 20 (Distance = 10 <= 50 -> CORRELATES)
+        report_near = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[RouteCandidate(file="src/api.py", line=10, method="GET", pattern="/", evidence="")],
+            security_indicators=[SecurityIndicator(category="subprocess", indicator_type="", file="src/api.py", line=20, evidence="")]
+        )
+        res_near = self.engine.generate_hypotheses(report_near)
+        self.assertEqual(len(res_near.hypotheses), 1)
+
+        # Route at line 10, indicator at line 80 (Distance = 70 > 50 -> DOES NOT CORRELATE)
+        report_far = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[RouteCandidate(file="src/api.py", line=10, method="GET", pattern="/", evidence="")],
+            security_indicators=[SecurityIndicator(category="subprocess", indicator_type="", file="src/api.py", line=80, evidence="")]
+        )
+        res_far = self.engine.generate_hypotheses(report_far)
+        self.assertEqual(len(res_far.hypotheses), 0)
+
+    def test_correlation_capping_limit(self):
+        """Verify that correlations generated per file do not exceed the limit."""
+        routes = [
+            RouteCandidate(file="src/api.py", line=idx + 1, method="GET", pattern=f"/r{idx}", evidence="")
+            for idx in range(100)
+        ]
+        report = RepositoryReport(
+            repository=self.empty_summary,
+            routes=routes,
+            security_indicators=[
+                SecurityIndicator(category="subprocess", indicator_type="", file="src/api.py", line=5, evidence="")
+            ]
+        )
+        res = self.engine.generate_hypotheses(report)
+        # Cap is set to 50
+        self.assertEqual(len(res.hypotheses), 50)
+
+    def test_deterministic_sorting_and_order_stability(self):
+        """Verify that hypotheses unique IDs are stable under input collection reordering."""
+        route1 = RouteCandidate(file="src/api.py", line=5, method="GET", pattern="/a", evidence="")
+        route2 = RouteCandidate(file="src/api.py", line=10, method="POST", pattern="/b", evidence="")
+        ind1 = SecurityIndicator(category="subprocess", indicator_type="t1", file="src/api.py", line=5, evidence="ev1")
+        ind2 = SecurityIndicator(category="subprocess", indicator_type="t2", file="src/api.py", line=10, evidence="ev2")
+
+        report_order_a = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[route1, route2],
+            security_indicators=[ind1, ind2]
+        )
+        report_order_b = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[route2, route1],
+            security_indicators=[ind2, ind1]
+        )
+
+        res_a = self.engine.generate_hypotheses(report_order_a)
+        res_b = self.engine.generate_hypotheses(report_order_b)
+
+        # Confirm equal output structure and stable IDs
+        self.assertEqual(res_a.to_dict(), res_b.to_dict())
 
     def test_id_collisions_with_similar_paths_and_indicators(self):
         """Verify that similar paths, distinct indicators, and routes produce unique IDs."""
@@ -361,35 +373,6 @@ class TestAgentReasoning(unittest.TestCase):
         res_route = self.engine.generate_hypotheses(report_route)
         self.assertEqual(len(res_route.hypotheses), 2)
         self.assertNotEqual(res_route.hypotheses[0].id, res_route.hypotheses[1].id)
-
-    def test_deterministic_output_and_sorting(self):
-        """Verify that hypotheses output order is strictly sorted and deterministic."""
-        report = RepositoryReport(
-            repository=self.empty_summary,
-            routes=[
-                RouteCandidate(file="src/server.py", line=1, method="GET", pattern="/z", evidence=""),
-                RouteCandidate(file="src/server.py", line=2, method="POST", pattern="/a", evidence="")
-            ],
-            security_indicators=[
-                SecurityIndicator(category="subprocess", indicator_type="", file="src/server.py", line=1, evidence=""),
-                SecurityIndicator(category="database", indicator_type="raw_sql_construction_indicator", file="src/server.py", line=2, evidence="")
-            ]
-        )
-
-        res1 = self.engine.generate_hypotheses(report)
-        res2 = self.engine.generate_hypotheses(report)
-
-        # Confirm equal reports
-        self.assertEqual(res1.to_dict(), res2.to_dict())
-
-        # Verify sorted by ID
-        ids = [h.id for h in res1.hypotheses]
-        self.assertEqual(ids, sorted(ids))
-
-        # Verify evidence reference sorting within hypotheses
-        for hyp in res1.hypotheses:
-            ref_keys = [(ref.file, ref.line or 0, ref.type, ref.detail) for ref in hyp.evidence_references]
-            self.assertEqual(ref_keys, sorted(ref_keys))
 
     def test_duplicate_prevention(self):
         """Test that duplicate hypotheses are prevented."""

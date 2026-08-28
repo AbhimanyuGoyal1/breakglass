@@ -2,7 +2,8 @@
 
 from abc import ABC, abstractmethod
 import hashlib
-from typing import Optional
+import json
+from typing import Optional, Dict, Any, List
 from breakglass.inspection.models import RepositoryReport
 from breakglass.reasoning.models import ReasoningReport, SecurityHypothesis, EvidenceReference
 
@@ -26,27 +27,107 @@ class ReasoningEngine(ABC):
 class DeterministicReasoningEngine(ReasoningEngine):
     """Deterministic security hypothesis engine correlating inspection evidence."""
 
-    def _generate_stable_id(self, category: str, primary_file: str, primary_line: Optional[int], unique_salt: str) -> str:
+    MAX_LINE_DISTANCE = 50
+    MAX_CORRELATIONS_PER_FILE = 50
+
+    def _generate_stable_id(self, category: str, identity: Dict[str, Any]) -> str:
         """Generates a stable, collision-resistant hypothesis ID using SHA-256."""
-        identity = f"cat={category};file={primary_file};line={primary_line};salt={unique_salt}"
-        hash_hex = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         prefix = f"HYP-{category.upper().replace('_', '-')}"
-        return f"{prefix}-{hash_hex[:16]}"
+        return f"{prefix}-{digest[:16]}"
+
+    def _check_proximity(self, line1: Optional[int], line2: Optional[int]) -> bool:
+        """Verifies if two line numbers are within the allowed MAX_LINE_DISTANCE."""
+        if line1 is None or line2 is None:
+            return True
+        return abs(line1 - line2) <= self.MAX_LINE_DISTANCE
 
     def generate_hypotheses(self, report: RepositoryReport) -> ReasoningReport:
         """Correlates static indicators, routes, and frameworks to generate hypotheses."""
         hypotheses_dict = {}
 
-        # 1. Rule 1: Subprocess execution + Reachable route (SAME FILE ONLY)
-        subprocess_indicators = [
-            ind for ind in report.security_indicators if ind.category == "subprocess"
-        ]
-        if subprocess_indicators and report.routes:
-            for ind in subprocess_indicators:
-                for route in report.routes:
-                    if ind.file == route.file:
-                        salt = f"route_file={route.file};route_line={route.line};route_method={route.method};route_pattern={route.pattern};evidence={ind.evidence}"
-                        hyp_id = self._generate_stable_id("command_injection", ind.file, ind.line, salt)
+        # 1. Deduplicate input candidates deterministically
+        unique_inds = []
+        ind_seen = set()
+        sorted_indicators = sorted(
+            report.security_indicators,
+            key=lambda x: (x.file, x.line or 0, x.category, x.indicator_type, x.evidence)
+        )
+        for ind in sorted_indicators:
+            key = (ind.file, ind.line, ind.category, ind.indicator_type, ind.evidence)
+            if key not in ind_seen:
+                ind_seen.add(key)
+                unique_inds.append(ind)
+
+        unique_routes = []
+        route_seen = set()
+        sorted_routes = sorted(
+            report.routes,
+            key=lambda x: (x.file, x.line or 0, x.method, x.pattern, x.evidence)
+        )
+        for r in sorted_routes:
+            key = (r.file, r.line, r.method, r.pattern, r.evidence)
+            if key not in route_seen:
+                route_seen.add(key)
+                unique_routes.append(r)
+
+        unique_eps = []
+        ep_seen = set()
+        sorted_eps = sorted(
+            report.entry_points,
+            key=lambda x: (x.file, x.line or 0, x.type, x.description)
+        )
+        for ep in sorted_eps:
+            key = (ep.file, ep.line, ep.type, ep.description)
+            if key not in ep_seen:
+                ep_seen.add(key)
+                unique_eps.append(ep)
+
+        # 2. Group candidates by file
+        inds_by_file = {}
+        for ind in unique_inds:
+            inds_by_file.setdefault(ind.file, []).append(ind)
+
+        routes_by_file = {}
+        for r in unique_routes:
+            routes_by_file.setdefault(r.file, []).append(r)
+
+        eps_by_file = {}
+        for ep in unique_eps:
+            eps_by_file.setdefault(ep.file, []).append(ep)
+
+        # 3. Rule 1: Subprocess execution + Reachable route (SAME FILE + PROXIMITY BOUNDED)
+        for filepath, file_inds in inds_by_file.items():
+            subprocess_file_inds = [ind for ind in file_inds if ind.category == "subprocess"]
+            file_routes = routes_by_file.get(filepath, [])
+            if subprocess_file_inds and file_routes:
+                correlations = 0
+                for ind in subprocess_file_inds:
+                    for route in file_routes:
+                        if correlations >= self.MAX_CORRELATIONS_PER_FILE:
+                            break
+                        if not self._check_proximity(ind.line, route.line):
+                            continue
+
+                        identity = {
+                            "rule": "command_injection",
+                            "ind": {
+                                "category": ind.category,
+                                "indicator_type": ind.indicator_type,
+                                "file": ind.file,
+                                "line": ind.line,
+                                "evidence": ind.evidence
+                            },
+                            "route": {
+                                "file": route.file,
+                                "line": route.line,
+                                "method": route.method,
+                                "pattern": route.pattern,
+                                "evidence": route.evidence
+                            }
+                        }
+                        hyp_id = self._generate_stable_id("command_injection", identity)
                         title = "Potential Local Command Injection via Endpoint"
                         severity = "HIGH"
                         confidence = 0.85
@@ -56,8 +137,8 @@ class DeterministicReasoningEngine(ReasoningEngine):
                         )
                         rationale = (
                             f"The HTTP route '{route.method} {route.pattern}' resides in the same file as a subprocess execution "
-                            f"call. If request parameters are passed directly to the command execution without strict "
-                            f"validation, it could lead to command injection."
+                            f"call within proximity. If request parameters are passed directly to the command execution without "
+                            f"strict validation, it could lead to command injection."
                         )
 
                         ev_ref1 = EvidenceReference(
@@ -85,18 +166,42 @@ class DeterministicReasoningEngine(ReasoningEngine):
                             evidence_references=refs,
                             rationale=rationale
                         )
+                        correlations += 1
 
-        # 2. Rule 2: SQL construction + Reachable route (SAME FILE ONLY, RAW SQL CONSTRUCTION ONLY)
-        db_indicators = [
-            ind for ind in report.security_indicators
-            if ind.category == "database" and ind.indicator_type == "raw_sql_construction_indicator"
-        ]
-        if db_indicators and report.routes:
-            for ind in db_indicators:
-                for route in report.routes:
-                    if ind.file == route.file:
-                        salt = f"route_file={route.file};route_line={route.line};route_method={route.method};route_pattern={route.pattern};evidence={ind.evidence}"
-                        hyp_id = self._generate_stable_id("sql_injection", ind.file, ind.line, salt)
+        # 4. Rule 2: SQL construction + Reachable route (SAME FILE + PROXIMITY BOUNDED, RAW SQL ONLY)
+        for filepath, file_inds in inds_by_file.items():
+            db_file_inds = [
+                ind for ind in file_inds
+                if ind.category == "database" and ind.indicator_type == "raw_sql_construction_indicator"
+            ]
+            file_routes = routes_by_file.get(filepath, [])
+            if db_file_inds and file_routes:
+                correlations = 0
+                for ind in db_file_inds:
+                    for route in file_routes:
+                        if correlations >= self.MAX_CORRELATIONS_PER_FILE:
+                            break
+                        if not self._check_proximity(ind.line, route.line):
+                            continue
+
+                        identity = {
+                            "rule": "sql_injection",
+                            "ind": {
+                                "category": ind.category,
+                                "indicator_type": ind.indicator_type,
+                                "file": ind.file,
+                                "line": ind.line,
+                                "evidence": ind.evidence
+                            },
+                            "route": {
+                                "file": route.file,
+                                "line": route.line,
+                                "method": route.method,
+                                "pattern": route.pattern,
+                                "evidence": route.evidence
+                            }
+                        }
+                        hyp_id = self._generate_stable_id("sql_injection", identity)
                         title = "Potential Local SQL Injection"
                         severity = "HIGH"
                         confidence = 0.80
@@ -135,17 +240,38 @@ class DeterministicReasoningEngine(ReasoningEngine):
                             evidence_references=refs,
                             rationale=rationale
                         )
+                        correlations += 1
 
-        # 3. Rule 3: Deserialization / Unsafe Eval + Entry Point (SAME FILE ONLY)
-        serialization_indicators = [
-            ind for ind in report.security_indicators if ind.category == "serialization"
-        ]
-        if serialization_indicators and report.entry_points:
-            for ind in serialization_indicators:
-                for ep in report.entry_points:
-                    if ind.file == ep.file:
-                        salt = f"ep_file={ep.file};ep_line={ep.line};ep_type={ep.type};ep_desc={ep.description};evidence={ind.evidence}"
-                        hyp_id = self._generate_stable_id("remote_code_execution", ind.file, ind.line, salt)
+        # 5. Rule 3: Deserialization / Unsafe Eval + Entry Point (SAME FILE + PROXIMITY BOUNDED)
+        for filepath, file_inds in inds_by_file.items():
+            serialization_file_inds = [ind for ind in file_inds if ind.category == "serialization"]
+            file_eps = eps_by_file.get(filepath, [])
+            if serialization_file_inds and file_eps:
+                correlations = 0
+                for ind in serialization_file_inds:
+                    for ep in file_eps:
+                        if correlations >= self.MAX_CORRELATIONS_PER_FILE:
+                            break
+                        if not self._check_proximity(ind.line, ep.line):
+                            continue
+
+                        identity = {
+                            "rule": "remote_code_execution",
+                            "ind": {
+                                "category": ind.category,
+                                "indicator_type": ind.indicator_type,
+                                "file": ind.file,
+                                "line": ind.line,
+                                "evidence": ind.evidence
+                            },
+                            "entry_point": {
+                                "file": ep.file,
+                                "type": ep.type,
+                                "description": ep.description,
+                                "line": ep.line
+                            }
+                        }
+                        hyp_id = self._generate_stable_id("remote_code_execution", identity)
                         title = "Potential Local Code Execution via Entry Point"
                         severity = "CRITICAL"
                         confidence = 0.90
@@ -184,17 +310,28 @@ class DeterministicReasoningEngine(ReasoningEngine):
                             evidence_references=refs,
                             rationale=rationale
                         )
+                        correlations += 1
 
-        # 4. Rule 4: Cloud Secrets / Cloud SDK + Web Framework (BOUNDED project correlation)
+        # 6. Rule 4: Cloud Secrets / Cloud SDK + Web Framework (BOUNDED project correlation)
         cloud_indicators = [
-            ind for ind in report.security_indicators if ind.category in ("cloud_sdk", "secret_config")
+            ind for ind in unique_inds if ind.category in ("cloud_sdk", "secret_config")
         ]
         if cloud_indicators and report.repository.frameworks:
-            sorted_frameworks = sorted(report.repository.frameworks)
+            sorted_frameworks = sorted(list(set(report.repository.frameworks)))
             framework_list_str = ", ".join(sorted_frameworks)
             for ind in cloud_indicators:
-                salt = f"frameworks={','.join(sorted_frameworks)};evidence={ind.evidence}"
-                hyp_id = self._generate_stable_id("credential_exposure", ind.file, ind.line, salt)
+                identity = {
+                    "rule": "credential_exposure",
+                    "ind": {
+                        "category": ind.category,
+                        "indicator_type": ind.indicator_type,
+                        "file": ind.file,
+                        "line": ind.line,
+                        "evidence": ind.evidence
+                    },
+                    "frameworks": sorted_frameworks
+                }
+                hyp_id = self._generate_stable_id("credential_exposure", identity)
                 title = "Potential Cloud Credential / Config Exposure"
                 desc = (
                     f"A cloud SDK or secret configuration reference in '{ind.file}' on line {ind.line} "

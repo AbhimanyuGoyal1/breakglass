@@ -17,6 +17,8 @@ class LLMReasoningEngine:
 
     def _clean_json_text(self, text: str) -> str:
         """Strips markdown block wrappers and extracts raw JSON content."""
+        if not isinstance(text, str):
+            return ""
         text = text.strip()
         if text.startswith("```"):
             lines = text.splitlines()
@@ -77,11 +79,24 @@ class LLMReasoningEngine:
 
     def _generate_stable_id(self, category: str, title: str, description: str, references: List[EvidenceReference]) -> str:
         """Generates a stable, collision-resistant hypothesis ID using SHA-256."""
-        ref_str = ",".join(f"{r.type}:{r.file}:{r.line}" for r in references)
-        identity = f"cat={category};title={title};desc={description};refs={ref_str}"
-        hash_hex = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        ref_list = []
+        for r in references:
+            ref_list.append({
+                "type": r.type,
+                "file": r.file,
+                "line": r.line,
+                "detail": r.detail
+            })
+        identity = {
+            "category": category,
+            "title": title,
+            "description": description,
+            "references": ref_list
+        }
+        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         prefix = f"HYP-LLM-{category.upper().replace('_', '-')}"
-        return f"{prefix}-{hash_hex[:16]}"
+        return f"{prefix}-{digest[:16]}"
 
     def analyze(
         self,
@@ -99,6 +114,13 @@ class LLMReasoningEngine:
                 hypotheses=[],
                 validation_status="failed",
                 errors=[f"LLM Client generation failed: {str(e)}"]
+            )
+
+        if not isinstance(raw_response, str):
+            return ReasoningReport(
+                hypotheses=[],
+                validation_status="failed",
+                errors=[f"LLM Client returned invalid response type: {type(raw_response).__name__}"]
             )
 
         cleaned_text = self._clean_json_text(raw_response)
@@ -156,18 +178,44 @@ class LLMReasoningEngine:
                 errors.append(f"Hypothesis #{idx} is missing required fields: {', '.join(missing_fields)}")
                 continue
 
+            # Validate field types strictly
+            field_types = {
+                "id": str,
+                "title": str,
+                "description": str,
+                "category": str,
+                "severity": str,
+                "rationale": str,
+            }
+            type_errors = []
+            for field_name, expected_type in field_types.items():
+                val = item[field_name]
+                if not isinstance(val, expected_type):
+                    type_errors.append(f"'{field_name}' must be of type {expected_type.__name__} (got {type(val).__name__})")
+
+            # Check confidence type explicitly (float or int, excluding bool)
+            conf_val = item["confidence"]
+            if not isinstance(conf_val, (int, float)) or isinstance(conf_val, bool):
+                type_errors.append(f"'confidence' must be an integer or float (got {type(conf_val).__name__})")
+
+            # Check evidence_references type
+            refs_val = item["evidence_references"]
+            if not isinstance(refs_val, list):
+                type_errors.append(f"'evidence_references' must be a list (got {type(refs_val).__name__})")
+
+            if type_errors:
+                errors.append(f"Hypothesis #{idx} has invalid field types: {', '.join(type_errors)}")
+                continue
+
             # 2. Field validation
             severity = item["severity"]
             if severity not in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
-                errors.append(f"Hypothesis #{idx} has invalid severity: {severity}")
+                errors.append(f"Hypothesis #{idx} has invalid severity value: {severity}")
                 continue
 
-            try:
-                confidence = float(item["confidence"])
-                if not (0.0 <= confidence <= 1.0):
-                    raise ValueError
-            except (ValueError, TypeError):
-                errors.append(f"Hypothesis #{idx} has invalid confidence: {item.get('confidence')}")
+            confidence = float(item["confidence"])
+            if not (0.0 <= confidence <= 1.0):
+                errors.append(f"Hypothesis #{idx} confidence value is out of bounds: {confidence}")
                 continue
 
             category = item["category"]
@@ -175,15 +223,10 @@ class LLMReasoningEngine:
                 errors.append(f"Hypothesis #{idx} has unsupported category: {category}")
                 continue
 
-            raw_references = item["evidence_references"]
-            if not isinstance(raw_references, list):
-                errors.append(f"Hypothesis #{idx} 'evidence_references' must be a list")
-                continue
-
             # 3. Evidence validation
             ref_errors = []
             parsed_references = []
-            for r_idx, ref_item in enumerate(raw_references, start=1):
+            for r_idx, ref_item in enumerate(refs_val, start=1):
                 # Ensure each reference is a dictionary
                 if not isinstance(ref_item, dict):
                     ref_errors.append(f"Reference #{r_idx} in Hypothesis #{idx} is not a valid JSON object/dictionary")
@@ -192,21 +235,35 @@ class LLMReasoningEngine:
                 ref_fields = ["type", "file", "detail"]
                 missing_ref_fields = [f for f in ref_fields if f not in ref_item]
                 if missing_ref_fields:
-                    ref_errors.append(f"Reference #{r_idx} is missing fields: {', '.join(missing_ref_fields)}")
+                    ref_errors.append(f"Reference #{r_idx} in Hypothesis #{idx} is missing fields: {', '.join(missing_ref_fields)}")
                     continue
 
+                # Enforce strict field types on references
                 ref_type = ref_item["type"]
+                ref_file = ref_item["file"]
+                ref_detail = ref_item["detail"]
+
+                ref_type_errors = []
+                if not isinstance(ref_type, str):
+                    ref_type_errors.append(f"'type' must be str (got {type(ref_type).__name__})")
+                if not isinstance(ref_file, str):
+                    ref_type_errors.append(f"'file' must be str (got {type(ref_file).__name__})")
+                if not isinstance(ref_detail, str):
+                    ref_type_errors.append(f"'detail' must be str (got {type(ref_detail).__name__})")
+
+                if ref_type_errors:
+                    ref_errors.append(f"Reference #{r_idx} in Hypothesis #{idx} has invalid types: {', '.join(ref_type_errors)}")
+                    continue
+
                 if ref_type not in ("security_indicator", "route", "entry_point", "file"):
                     ref_errors.append(f"Reference #{r_idx} has invalid type: {ref_type}")
                     continue
 
-                ref_file = ref_item["file"]
                 ref_line = ref_item.get("line")
                 if ref_line is not None:
-                    try:
-                        ref_line = int(ref_line)
-                    except (ValueError, TypeError):
-                        ref_errors.append(f"Reference #{r_idx} has invalid line number: {ref_line}")
+                    # Enforce strict schema-level integer check for line numbers (exclude floats and booleans)
+                    if not isinstance(ref_line, int) or isinstance(ref_line, bool):
+                        ref_errors.append(f"Reference #{r_idx} line number must be an integer or null (got {type(ref_line).__name__})")
                         continue
 
                 # Resolve reference against authoritative inspection report

@@ -451,6 +451,102 @@ class TestLLMReasoning(unittest.TestCase):
         mock_run.assert_not_called()
         mock_system.assert_not_called()
 
+    def test_untrusted_provider_responses(self):
+        """Verify that provider response types like None, integer, or list fail validation cleanly."""
+        engine = LLMReasoningEngine(MockLLMClient(response_text=None))
+        res = engine.analyze(self.report, self.det_report)
+        self.assertEqual(res.validation_status, "failed")
+        self.assertTrue(any("invalid response type" in err for err in res.errors))
+
+        engine.client = MockLLMClient(response_text=123)
+        res = engine.analyze(self.report, self.det_report)
+        self.assertEqual(res.validation_status, "failed")
+
+        engine.client = MockLLMClient(response_text=[])
+        res = engine.analyze(self.report, self.det_report)
+        self.assertEqual(res.validation_status, "failed")
+
+    def test_untrusted_field_types_harden(self):
+        """Verify that incorrect field types (e.g. list/integer/dict/null where string is expected) are cleanly rejected."""
+        cases = [
+            # 1. file is a list
+            {"type": "route", "file": [], "line": 12, "detail": "detail"},
+            # 2. file is a dict
+            {"type": "route", "file": {}, "line": 12, "detail": "detail"},
+            # 3. file is an integer
+            {"type": "route", "file": 123, "line": 12, "detail": "detail"},
+            # 4. file is null for a route type
+            {"type": "route", "file": None, "line": 12, "detail": "detail"},
+            # 5. type is an integer
+            {"type": 123, "file": "src/server.py", "line": 12, "detail": "detail"},
+            # 6. detail is a list
+            {"type": "route", "file": "src/server.py", "line": 12, "detail": []},
+            # 7. line is a dict
+            {"type": "route", "file": "src/server.py", "line": {}, "detail": "detail"},
+        ]
+
+        engine = LLMReasoningEngine(MockLLMClient())
+        for idx, ref in enumerate(cases):
+            payload = {
+                "hypotheses": [
+                    {
+                        "id": "HYP-LLM-001",
+                        "title": "Title",
+                        "description": "Desc",
+                        "category": "command_injection",
+                        "severity": "HIGH",
+                        "confidence": 0.85,
+                        "rationale": "Rationale",
+                        "evidence_references": [ref]
+                    }
+                ]
+            }
+            engine.client = MockLLMClient(response_text=json.dumps(payload))
+            res = engine.analyze(self.report, self.det_report)
+            self.assertEqual(res.validation_status, "failed", f"Case #{idx} did not fail cleanly")
+            self.assertTrue(len(res.errors) > 0)
+            self.assertEqual(len(res.hypotheses), 0)
+
+    def test_strict_line_number_types(self):
+        """Verify that line numbers that are floats, strings, or booleans are rejected strictly."""
+        invalid_lines = [
+            12.9,       # float
+            "12",       # string
+            True,       # boolean True
+            False,      # boolean False
+            []          # list
+        ]
+
+        engine = LLMReasoningEngine(MockLLMClient())
+        for idx, val in enumerate(invalid_lines):
+            payload = {
+                "hypotheses": [
+                    {
+                        "id": "HYP-LLM-001",
+                        "title": "Title",
+                        "description": "Desc",
+                        "category": "command_injection",
+                        "severity": "HIGH",
+                        "confidence": 0.85,
+                        "rationale": "Rationale",
+                        "evidence_references": [
+                            {
+                                "type": "route",
+                                "file": "src/server.py",
+                                "line": val,
+                                "detail": "detail"
+                            }
+                        ]
+                    }
+                ]
+            }
+            engine.client = MockLLMClient(response_text=json.dumps(payload))
+            res = engine.analyze(self.report, self.det_report)
+            self.assertEqual(res.validation_status, "failed", f"Line check for val {val} did not fail cleanly")
+            self.assertTrue(len(res.errors) > 0)
+            self.assertEqual(len(res.hypotheses), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
