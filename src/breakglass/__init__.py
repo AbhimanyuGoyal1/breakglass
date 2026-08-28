@@ -15,6 +15,15 @@ from breakglass.llm import (
     MockLLMClient,
     LLMReasoningEngine
 )
+from breakglass.validation import (
+    ValidationStatus,
+    ValidationResult,
+    SandboxValidator,
+    MockSandboxValidator,
+    TrueForgeSandboxValidator,
+    ValidationConfig,
+    ValidationEngine
+)
 
 __all__ = [
     "inspect_repository",
@@ -28,7 +37,14 @@ __all__ = [
     "LLMResponse",
     "LLMClient",
     "MockLLMClient",
-    "LLMReasoningEngine"
+    "LLMReasoningEngine",
+    "ValidationStatus",
+    "ValidationResult",
+    "SandboxValidator",
+    "MockSandboxValidator",
+    "TrueForgeSandboxValidator",
+    "ValidationConfig",
+    "ValidationEngine"
 ]
 __version__ = "0.1.0"
 
