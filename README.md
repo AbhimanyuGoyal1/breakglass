@@ -141,10 +141,11 @@ print(f"Errors: {llm_report.errors}")
   * **Correlation Cap:** Imposes a strict limit of 50 correlations generated per file.
 * **Stable Hypothesis IDs:** Hypothesis IDs are generated deterministically using SHA-256 hashes of their canonical serialized identities (sorted keys and complete evidence correlation data) to prevent collisions.
 * **Validation Abstraction (Milestone 4A):** Pluggable validation engine orchestrates and executes hypotheses inside boundaries using TrueForge.
-  * **Validation States:** Tracks validation results explicitly: `NOT_ATTEMPTED`, `VALIDATED`, `NOT_CONFIRMED`, `SANDBOX_ERROR`, `TIMEOUT`, and `INVALID_HYPOTHESIS`.
-  * **Eligibility Boundary:** Validates hypothesis schema and references against static inspection report before sandbox entry.
-  * **Execution Safety:** Validator exceptions are caught and wrapped as `SANDBOX_ERROR` statuses. Sandbox outputs (`stdout`/`stderr`) are truncated safely to conform to resource limits.
-  * **Proximity & Bounding Controls:** Restricts sandbox processing to batches matching `max_hypotheses_per_run` configurations.
+  * **Validation States:** Tracks validation results explicitly: `NOT_ATTEMPTED`, `VALIDATED`, `NOT_CONFIRMED`, `SANDBOX_ERROR`, `TIMEOUT`, `INVALID_HYPOTHESIS`, and `PREFLIGHT_ERROR` (for pre-execution adapter configuration errors).
+  * **Eligibility Boundary:** Performs strict runtime type and constraint verification on all hypothesis fields. Validates and resolves all evidence references matching authoritative inspection report data, replacing caller-provided strings with report-generated details.
+  * **ID & Field Authentication:** Recomputes stable hypothesis IDs at the validation boundary to prevent tampering. Overwrites caller-supplied fields (title, description, severity, confidence, rationale) with authoritative generated data for deterministic hypotheses.
+  * **Non-blocking Timeout Execution:** Spawns sandbox validators inside a thread-pool, returning control immediately upon timeout. Note that Python threads cannot be forcibly terminated, so production validator adapters must enforce their own subprocess/container/API execution deadlines.
+  * **Execution Safety & Copy Sanitization:** Validator exceptions are caught and wrapped in `SANDBOX_ERROR` states. Sandbox results undergo integrity verification (checking type, invariants, ranges, serializable metadata, and size constraints) and are returned as copy-sanitized new objects.
   * **Sandbox Deferred:** Sandbox execution container setup and human approvals are deferred to subsequent milestones.
 
 ### Sandbox Validation (Milestone 4A)

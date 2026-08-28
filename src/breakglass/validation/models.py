@@ -13,6 +13,7 @@ class ValidationStatus(str, Enum):
     SANDBOX_ERROR = "SANDBOX_ERROR"
     TIMEOUT = "TIMEOUT"
     INVALID_HYPOTHESIS = "INVALID_HYPOTHESIS"
+    PREFLIGHT_ERROR = "PREFLIGHT_ERROR"
 
 
 @dataclass

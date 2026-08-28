@@ -417,6 +417,270 @@ class TestSandboxValidation(unittest.TestCase):
         mock_run.assert_not_called()
         mock_system.assert_not_called()
 
+    def test_validator_timeout_real_limit(self):
+        """Verify that a validator that hangs longer than timeout does not stall the orchestrator run."""
+        validator = SleepValidator(sleep_seconds=2.0)
+        # Configure timeout to be 0.05 seconds
+        engine = ValidationEngine(validator, ValidationConfig(timeout_seconds=0.05))
+
+        start_time = time.perf_counter()
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        elapsed = time.perf_counter() - start_time
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, ValidationStatus.TIMEOUT)
+        # Ensure it returns within 0.5s (meaning it did not wait for the full 2.0s sleep validator to finish)
+        self.assertTrue(elapsed < 0.5, f"Orchestrator hung for {elapsed} seconds")
+
+    def test_deterministic_reauthentication_extra_evidence(self):
+        """Verify that extra, missing, duplicate, or altered evidence references are strictly rejected."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # 1. Extra reference
+        extra_ref_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title=self.valid_hyp.title,
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=self.valid_hyp.evidence_references + [
+                EvidenceReference(type="file", file="config.json", line=None)
+            ],
+            rationale=self.valid_hyp.rationale
+        )
+        eligible, reason = engine.check_eligibility(extra_ref_hyp, self.report)
+        self.assertFalse(eligible)
+
+        # 2. Missing reference
+        missing_ref_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title=self.valid_hyp.title,
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=[self.valid_hyp.evidence_references[0]],
+            rationale=self.valid_hyp.rationale
+        )
+        eligible, _ = engine.check_eligibility(missing_ref_hyp, self.report)
+        self.assertFalse(eligible)
+
+        # 3. Duplicate reference
+        dup_ref_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title=self.valid_hyp.title,
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=[
+                self.valid_hyp.evidence_references[0],
+                self.valid_hyp.evidence_references[0]
+            ],
+            rationale=self.valid_hyp.rationale
+        )
+        eligible, _ = engine.check_eligibility(dup_ref_hyp, self.report)
+        self.assertFalse(eligible)
+
+    def test_duplicate_same_location_indicator(self):
+        """Verify multiple indicators on the same file/line resolve and authenticate deterministically."""
+        report_dup = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[
+                RouteCandidate(file="src/server.py", line=12, method="POST", pattern="/run", evidence="")
+            ],
+            security_indicators=[
+                # Indicator 1: Subprocess call on line 15
+                SecurityIndicator(
+                    category="subprocess",
+                    indicator_type="subprocess_execution_indicator",
+                    file="src/server.py",
+                    line=15,
+                    evidence="subprocess.run"
+                ),
+                # Indicator 2: Database raw SQL on line 15 (same file/line!)
+                SecurityIndicator(
+                    category="database",
+                    indicator_type="raw_sql_construction_indicator",
+                    file="src/server.py",
+                    line=15,
+                    evidence="SELECT id FROM users"
+                )
+            ]
+        )
+        det_engine = DeterministicReasoningEngine()
+        det_report = det_engine.generate_hypotheses(report_dup)
+        self.assertEqual(len(det_report.hypotheses), 2)
+
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # Both deterministic hypotheses must authenticate cleanly
+        for hyp in det_report.hypotheses:
+            eligible, reason = engine.check_eligibility(hyp, report_dup)
+            self.assertTrue(eligible, f"Failed to authenticate {hyp.id}: {reason}")
+
+    def test_sandbox_visible_deterministic_hypothesis_field_authentication(self):
+        """Verify title, description, severity, confidence, and rationale modifications are overwritten/reconstructed."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # Modify fields that reach the sandbox
+        modified_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title="Modified Unsafe Title",
+            description="Modified Description",
+            category=self.valid_hyp.category,
+            severity="CRITICAL",  # Original was HIGH
+            confidence=0.1,       # Original was 0.85
+            evidence_references=self.valid_hyp.evidence_references,
+            rationale="Modified Rationale"
+        )
+
+        results = engine.validate_hypotheses([modified_hyp], self.report)
+        self.assertEqual(len(results), 1)
+        # Eligible check succeeded
+        self.assertEqual(results[0].status, ValidationStatus.NOT_CONFIRMED)
+
+        # Retrieve the hypothesis passed to mock validator's validate() method
+        self.assertEqual(len(validator.last_validated), 1)
+        hyp_passed = validator.last_validated[0][0]
+
+        # Verify that all fields were reconstructed from authoritative generated data
+        self.assertEqual(hyp_passed.title, self.valid_hyp.title)
+        self.assertEqual(hyp_passed.description, self.valid_hyp.description)
+        self.assertEqual(hyp_passed.severity, "HIGH")
+        self.assertEqual(hyp_passed.confidence, 0.85)
+        self.assertEqual(hyp_passed.rationale, self.valid_hyp.rationale)
+
+    def test_eligibility_strict_runtime_validation(self):
+        """Verify strict runtime type validation of SecurityHypothesis input fields."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        cases = [
+            # 1. Non-string title
+            {"title": 123},
+            # 2. Empty description
+            {"description": ""},
+            # 3. Invalid severity
+            {"severity": "CRITICAL_MAX"},
+            # 4. NaN confidence
+            {"confidence": float("nan")},
+            # 5. Infinity confidence
+            {"confidence": float("inf")},
+            # 6. Boolean confidence
+            {"confidence": True},
+            # 7. Non-string rationale
+            {"rationale": []},
+            # 8. Malformed evidence reference
+            {"evidence_references": [None]},
+        ]
+
+        for idx, patch_fields in enumerate(cases):
+            params = {
+                "id": self.valid_hyp.id,
+                "title": self.valid_hyp.title,
+                "description": self.valid_hyp.description,
+                "category": self.valid_hyp.category,
+                "severity": self.valid_hyp.severity,
+                "confidence": self.valid_hyp.confidence,
+                "evidence_references": self.valid_hyp.evidence_references,
+                "rationale": self.valid_hyp.rationale
+            }
+            params.update(patch_fields)
+            bad_hyp = SecurityHypothesis(**params)
+            eligible, reason = engine.check_eligibility(bad_hyp, self.report)
+            self.assertFalse(eligible, f"Case #{idx} accepted: {reason}")
+
+    def test_validation_result_integrity_hardening(self):
+        """Verify strict validations of ValidationResult invariants, types, copy-sanitization, and size limits."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # 1. attempted is integer 1 (not boolean)
+        res_int_bool = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=1,  # type is int, not bool
+            confirmed=True
+        )
+        res = engine._validate_result_integrity(res_int_bool, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+
+        # 2. negative duration
+        res_neg_dur = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True,
+            duration=-5.0
+        )
+        res = engine._validate_result_integrity(res_neg_dur, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+
+        # 3. infinite duration
+        res_inf_dur = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True,
+            duration=float("inf")
+        )
+        res = engine._validate_result_integrity(res_inf_dur, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+
+        # 4. non-serializable metadata
+        res_bad_meta = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True,
+            metadata={"func": lambda x: x}
+        )
+        res = engine._validate_result_integrity(res_bad_meta, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+
+        # 5. oversized evidence/metadata
+        res_oversized = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True,
+            evidence="C" * 150000  # 150KB (exceeds 100KB combined limit)
+        )
+        res = engine._validate_result_integrity(res_oversized, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+
+        # 6. Verify copy sanitization
+        valid_res = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True,
+            metadata={"env": "prod"}
+        )
+        sanitized = engine._validate_result_integrity(valid_res, self.valid_hyp.id)
+        self.assertIsNot(sanitized, valid_res)  # Must be a new copy
+        self.assertIsNot(sanitized.metadata, valid_res.metadata)  # Metadata copy
+
+    def test_trueforge_adapter_preflight_failure_vs_sandbox_error(self):
+        """Verify preflight configuration failure returns PREFLIGHT_ERROR status and attempted=False."""
+        tf_validator = TrueForgeSandboxValidator(api_key="")
+        engine = ValidationEngine(tf_validator)
+
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        self.assertEqual(len(results), 1)
+        r = results[0]
+
+        # Config check failure is PREFLIGHT_ERROR, attempted=False, confirmed=False
+        self.assertEqual(r.status, ValidationStatus.PREFLIGHT_ERROR)
+        self.assertFalse(r.attempted)
+        self.assertFalse(r.confirmed)
+        self.assertIn("Missing TRUEFORGE_API_KEY", r.error_message)
+
 
 if __name__ == "__main__":
     unittest.main()

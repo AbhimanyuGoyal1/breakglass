@@ -73,7 +73,7 @@ class TrueForgeSandboxValidator(SandboxValidator):
         if not self.api_key:
             return ValidationResult(
                 hypothesis_id=hypothesis.id,
-                status=ValidationStatus.SANDBOX_ERROR,
+                status=ValidationStatus.PREFLIGHT_ERROR,
                 attempted=False,
                 confirmed=False,
                 error_message="Sandbox configuration error: Missing TRUEFORGE_API_KEY"

@@ -4,6 +4,7 @@ import concurrent.futures
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import time
 from typing import List, Tuple, Optional, Any, Dict
 from breakglass.inspection.models import RepositoryReport
@@ -108,7 +109,20 @@ class ValidationEngine:
         if ref.type == "security_indicator":
             for ind in report.security_indicators:
                 if ind.file == ref.file and (ind.line == ref.line or (ind.line is None and ref.line is None)):
-                    return True, f"Security indicator: {ind.evidence}"
+                    expected_detail = ""
+                    if ind.category == "subprocess":
+                        expected_detail = f"Subprocess call: {ind.evidence}"
+                    elif ind.category == "database":
+                        expected_detail = f"Database indicator: {ind.evidence}"
+                    elif ind.category == "serialization":
+                        expected_detail = f"Serialization call: {ind.evidence}"
+                    elif ind.category in ("cloud_sdk", "secret_config"):
+                        expected_detail = f"Cloud/Secrets indicator: {ind.evidence}"
+                    else:
+                        expected_detail = f"Security indicator: {ind.evidence}"
+
+                    if ref.detail == expected_detail:
+                        return True, expected_detail
             return False, ""
         elif ref.type == "route":
             for r in report.routes:
@@ -179,13 +193,25 @@ class ValidationEngine:
                 "references": ref_list
             }
             expected_id = generate_hypothesis_id(hypothesis.category, identity, is_llm=True)
+            return expected_id == hypothesis.id
         else:
-            # Reconstruct deterministic reasoning identity mapping based on category and references
-            # We match the indicator reference and correlating route/entry_point
+            # Reconstruct deterministic identity from the correlated indicators and routes
+            # Verify complete evidence set matches canonical references exactly.
             ind_ref = next((r for r in canonical_references if r.type == "security_indicator"), None)
             ind = None
             if ind_ref:
-                ind = next((i for i in report.security_indicators if i.file == ind_ref.file and (i.line == ind_ref.line or (i.line is None and ind_ref.line is None))), None)
+                # Select correct indicator matching same file, line, and evidence detail pattern
+                ind = next((
+                    i for i in report.security_indicators
+                    if i.file == ind_ref.file
+                    and (i.line == ind_ref.line or (i.line is None and ind_ref.line is None))
+                    and ind_ref.detail in (
+                        f"Subprocess call: {i.evidence}",
+                        f"Database indicator: {i.evidence}",
+                        f"Serialization call: {i.evidence}",
+                        f"Cloud/Secrets indicator: {i.evidence}"
+                    )
+                ), None)
 
             if hypothesis.category == "command_injection":
                 route_ref = next((r for r in canonical_references if r.type == "route"), None)
@@ -277,15 +303,68 @@ class ValidationEngine:
                 return False
 
             expected_id = generate_hypothesis_id(hypothesis.category, identity, is_llm=False)
+            if expected_id != hypothesis.id:
+                return False
 
-        return expected_id == hypothesis.id
+            # Strict Re-Authentication of full deterministic fields to prevent parameters tampering
+            from breakglass.reasoning.engine import DeterministicReasoningEngine
+            det_report = DeterministicReasoningEngine().generate_hypotheses(report)
+            auth_hyp = next((h for h in det_report.hypotheses if h.id == hypothesis.id), None)
+            if not auth_hyp:
+                return False
+
+            # Enforce exact match on supplied references against authoritative list
+            supplied_refs_canonical = []
+            for ref in hypothesis.evidence_references:
+                if not isinstance(ref, EvidenceReference):
+                    return False
+                valid, auth_detail = self._resolve_and_validate_evidence(ref, report)
+                if not valid:
+                    return False
+                supplied_refs_canonical.append({
+                    "type": ref.type,
+                    "file": ref.file,
+                    "line": ref.line,
+                    "detail": auth_detail
+                })
+
+            expected_refs_canonical = [
+                {
+                    "type": r.type,
+                    "file": r.file,
+                    "line": r.line,
+                    "detail": r.detail
+                }
+                for r in auth_hyp.evidence_references
+            ]
+
+            supplied_refs_canonical.sort(key=lambda x: (x["file"], x["line"] or 0, x["type"], x["detail"]))
+            expected_refs_canonical.sort(key=lambda x: (x["file"], x["line"] or 0, x["type"], x["detail"]))
+
+            if supplied_refs_canonical != expected_refs_canonical:
+                return False
+
+            # Overwrite all fields with authoritative ones
+            hypothesis.title = auth_hyp.title
+            hypothesis.description = auth_hyp.description
+            hypothesis.category = auth_hyp.category
+            hypothesis.severity = auth_hyp.severity
+            hypothesis.confidence = auth_hyp.confidence
+            hypothesis.evidence_references = auth_hyp.evidence_references
+            hypothesis.rationale = auth_hyp.rationale
+            return True
 
     def check_eligibility(self, hypothesis: SecurityHypothesis, report: RepositoryReport) -> Tuple[bool, str]:
         """Checks if a hypothesis is eligible for sandbox execution."""
+        # 1. Strict Type Validation of SecurityHypothesis input shape
         if not hypothesis or not isinstance(hypothesis, SecurityHypothesis):
             return False, "Invalid hypothesis object type"
-        if not hypothesis.id or not isinstance(hypothesis.id, str):
+        if not isinstance(hypothesis.id, str) or not hypothesis.id.strip():
             return False, "Invalid or missing hypothesis ID"
+        if not isinstance(hypothesis.title, str) or not hypothesis.title.strip():
+            return False, "Invalid or missing title"
+        if not isinstance(hypothesis.description, str) or not hypothesis.description.strip():
+            return False, "Invalid or missing description"
 
         supported_categories = {
             "command_injection",
@@ -298,13 +377,36 @@ class ValidationEngine:
             "broken_access_control",
             "insecure_authentication",
         }
-        if hypothesis.category not in supported_categories:
-            return False, f"Unsupported category: {hypothesis.category}"
+        if not isinstance(hypothesis.category, str) or hypothesis.category not in supported_categories:
+            return False, f"Unsupported or invalid category: {hypothesis.category}"
+        if not isinstance(hypothesis.severity, str) or hypothesis.severity not in {"CRITICAL", "HIGH", "MEDIUM", "LOW"}:
+            return False, f"Invalid severity: {hypothesis.severity}"
+
+        if not isinstance(hypothesis.confidence, (int, float)) or isinstance(hypothesis.confidence, bool):
+            return False, f"Invalid confidence type: {type(hypothesis.confidence).__name__}"
+        if not math.isfinite(hypothesis.confidence) or not (0.0 <= hypothesis.confidence <= 1.0):
+            return False, f"Confidence value out of bounds: {hypothesis.confidence}"
+
+        if not isinstance(hypothesis.rationale, str):
+            return False, "Invalid rationale type"
 
         if not isinstance(hypothesis.evidence_references, list) or not hypothesis.evidence_references:
-            return False, "Missing or invalid evidence references"
+            return False, "Missing or invalid evidence references list"
 
-        # Authenticate ID and verify all references resolve to authoritative details
+        for idx, ref in enumerate(hypothesis.evidence_references):
+            if not isinstance(ref, EvidenceReference):
+                return False, f"Evidence reference at index {idx} is not of type EvidenceReference"
+            if not isinstance(ref.type, str) or ref.type not in {"security_indicator", "route", "entry_point", "file"}:
+                return False, f"Invalid reference type at index {idx}"
+            if not isinstance(ref.file, str) or not ref.file.strip():
+                return False, f"Invalid reference file at index {idx}"
+            if ref.line is not None:
+                if not isinstance(ref.line, int) or isinstance(ref.line, bool):
+                    return False, f"Invalid reference line at index {idx}"
+            if not isinstance(ref.detail, str):
+                return False, f"Invalid reference detail at index {idx}"
+
+        # 2. Authenticate ID and verify all references resolve to authoritative details
         if not self._authenticate_hypothesis_id(hypothesis, report):
             return False, "Hypothesis ID authentication failed: ID mismatch or fabricated references"
 
@@ -352,8 +454,20 @@ class ValidationEngine:
             ValidationStatus.SANDBOX_ERROR: (True, False),
             ValidationStatus.TIMEOUT: (True, False),
             ValidationStatus.INVALID_HYPOTHESIS: (False, False),
+            ValidationStatus.PREFLIGHT_ERROR: (False, False),
         }
+
         expected_attempted, expected_confirmed = invariants[result.status]
+        # Check strict bool types (reject integers 0/1)
+        if type(result.attempted) is not bool or type(result.confirmed) is not bool:
+            return ValidationResult(
+                hypothesis_id=expected_id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="attempted and confirmed fields must be exactly booleans"
+            )
+
         if result.attempted != expected_attempted or result.confirmed != expected_confirmed:
             return ValidationResult(
                 hypothesis_id=expected_id,
@@ -367,31 +481,51 @@ class ValidationEngine:
                 )
             )
 
-        # Validate parameter types
-        if result.duration is not None and (not isinstance(result.duration, (int, float)) or isinstance(result.duration, bool)):
+        # Validate parameter types strictly
+        if result.duration is not None:
+            if not isinstance(result.duration, (int, float)) or isinstance(result.duration, bool):
+                return ValidationResult(
+                    hypothesis_id=expected_id,
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=True,
+                    confirmed=False,
+                    error_message=f"Invalid duration type: {type(result.duration).__name__}"
+                )
+            if not math.isfinite(result.duration) or result.duration < 0:
+                return ValidationResult(
+                    hypothesis_id=expected_id,
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=True,
+                    confirmed=False,
+                    error_message=f"Invalid duration value: {result.duration}"
+                )
+
+        if not isinstance(result.confidence_delta, (int, float)) or isinstance(result.confidence_delta, bool):
             return ValidationResult(
                 hypothesis_id=expected_id,
                 status=ValidationStatus.SANDBOX_ERROR,
                 attempted=True,
                 confirmed=False,
-                error_message=f"Invalid duration type: {type(result.duration).__name__}"
+                error_message="Invalid confidence_delta type: must be a float or int (and not bool)"
             )
-        if not isinstance(result.confidence_delta, (int, float)) or isinstance(result.confidence_delta, bool) or not (-1.0 <= result.confidence_delta <= 1.0):
+        if not math.isfinite(result.confidence_delta) or not (-1.0 <= result.confidence_delta <= 1.0):
             return ValidationResult(
                 hypothesis_id=expected_id,
                 status=ValidationStatus.SANDBOX_ERROR,
                 attempted=True,
                 confirmed=False,
-                error_message=f"Invalid confidence_delta range or type: {result.confidence_delta}"
+                error_message=f"Invalid confidence_delta range: {result.confidence_delta}"
             )
-        if not isinstance(result.stdout, str) or not isinstance(result.stderr, str):
+
+        if not isinstance(result.stdout, str) or not isinstance(result.stderr, str) or not isinstance(result.evidence, str):
             return ValidationResult(
                 hypothesis_id=expected_id,
                 status=ValidationStatus.SANDBOX_ERROR,
                 attempted=True,
                 confirmed=False,
-                error_message="stdout and stderr must be strings"
+                error_message="stdout, stderr, and evidence must be strings"
             )
+
         if result.error_message is not None and not isinstance(result.error_message, str):
             return ValidationResult(
                 hypothesis_id=expected_id,
@@ -401,22 +535,74 @@ class ValidationEngine:
                 error_message="error_message must be a string or None"
             )
 
-        return result
+        # Validate metadata serialization and format
+        if not isinstance(result.metadata, dict):
+            return ValidationResult(
+                hypothesis_id=expected_id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="metadata must be a dictionary"
+            )
+        try:
+            json.dumps(result.metadata)
+        except Exception:
+            return ValidationResult(
+                hypothesis_id=expected_id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="metadata is not JSON-serializable"
+            )
+
+        # Enforce metadata/evidence size limits
+        # Combined evidence + metadata serialized size <= 100KB
+        meta_size = len(json.dumps(result.metadata).encode("utf-8"))
+        ev_size = len(result.evidence.encode("utf-8"))
+        if meta_size + ev_size > 100 * 1024:
+            return ValidationResult(
+                hypothesis_id=expected_id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="evidence + metadata size exceeds 100KB limit"
+            )
+
+        # Return a sanitized copy of ValidationResult
+        return ValidationResult(
+            hypothesis_id=expected_id,
+            status=result.status,
+            attempted=result.attempted,
+            confirmed=result.confirmed,
+            confidence_delta=float(result.confidence_delta),
+            evidence=result.evidence,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            duration=result.duration,
+            error_message=result.error_message,
+            metadata=dict(result.metadata)
+        )
 
     def _run_with_timeout(self, hyp: SecurityHypothesis, report: RepositoryReport) -> ValidationResult:
-        """Invokes SandboxValidator inside a thread pool with a timeout boundary."""
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self.validator.validate, hyp, report)
-            try:
-                return future.result(timeout=self.config.timeout_seconds)
-            except concurrent.futures.TimeoutError:
-                return ValidationResult(
-                    hypothesis_id=hyp.id or "",
-                    status=ValidationStatus.TIMEOUT,
-                    attempted=True,
-                    confirmed=False,
-                    error_message=f"Validation timed out after {self.config.timeout_seconds} seconds"
-                )
+        """Invokes SandboxValidator inside a thread pool with a timeout boundary, shutting down non-blockingly."""
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self.validator.validate, hyp, report)
+        try:
+            result = future.result(timeout=self.config.timeout_seconds)
+            executor.shutdown(wait=False)
+            return result
+        except concurrent.futures.TimeoutError:
+            executor.shutdown(wait=False)
+            return ValidationResult(
+                hypothesis_id=hyp.id or "",
+                status=ValidationStatus.TIMEOUT,
+                attempted=True,
+                confirmed=False,
+                error_message=f"Validation timed out after {self.config.timeout_seconds} seconds"
+            )
+        except Exception as e:
+            executor.shutdown(wait=False)
+            raise e
 
     def validate_hypotheses(
         self,
@@ -476,7 +662,7 @@ class ValidationEngine:
                 rationale=hyp.rationale
             )
 
-            # 3. Eligibility Check
+            # 3. Eligibility Check (This resolves references and reconstructs canonical fields)
             eligible, reason = self.check_eligibility(canonical_hyp, report)
             if not eligible:
                 results.append(
