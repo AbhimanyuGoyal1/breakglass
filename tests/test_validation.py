@@ -771,5 +771,52 @@ class TestSandboxValidation(unittest.TestCase):
         self.assertTrue(valid)
         self.assertEqual(resolved_detail, "Security indicator: custom_unsafe_func")
 
+    def test_fabricated_extra_evidence_references(self):
+        """Verify that appending a fabricated/malformed evidence reference to an otherwise valid deterministic hypothesis causes immediate rejection."""
+        # 1. Verify original valid hypothesis would otherwise authenticate and run
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, ValidationStatus.NOT_CONFIRMED)
+        self.assertEqual(len(validator.last_validated), 1)
+
+        # Reset mock state
+        validator.last_validated = []
+
+        # 2. Append a fabricated reference to the references
+        import copy
+        bad_references = copy.deepcopy(self.valid_hyp.evidence_references)
+        bad_references.append(
+            EvidenceReference(
+                type="file",
+                file="fabricated_nonexistent_file.py",
+                line=None,
+                detail="File: fabricated_nonexistent_file.py"
+            )
+        )
+
+        bad_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title=self.valid_hyp.title,
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=bad_references,
+            rationale=self.valid_hyp.rationale
+        )
+
+        results_bad = engine.validate_hypotheses([bad_hyp], self.report)
+        self.assertEqual(len(results_bad), 1)
+
+        # Must fail eligibility check: status = INVALID_HYPOTHESIS, attempted = False
+        self.assertEqual(results_bad[0].status, ValidationStatus.INVALID_HYPOTHESIS)
+        self.assertFalse(results_bad[0].attempted)
+        self.assertIn("fabricated", results_bad[0].error_message.lower())
+
+        # Ensure the hypothesis NEVER reaches the sandbox
+        self.assertEqual(len(validator.last_validated), 0)
+
 if __name__ == "__main__":
     unittest.main()

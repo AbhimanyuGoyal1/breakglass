@@ -638,17 +638,33 @@ class ValidationEngine:
         for hyp in limited_hypotheses:
             # Reconstruct evidence with authoritative details before validation
             canonical_references = []
+            has_invalid_ref = False
             for ref in hyp.evidence_references:
                 valid, auth_detail = self._resolve_and_validate_evidence(ref, report)
-                if valid:
-                    canonical_references.append(
-                        EvidenceReference(
-                            type=ref.type,
-                            file=ref.file,
-                            line=ref.line,
-                            detail=auth_detail
-                        )
+                if not valid:
+                    has_invalid_ref = True
+                    break
+                canonical_references.append(
+                    EvidenceReference(
+                        type=ref.type,
+                        file=ref.file,
+                        line=ref.line,
+                        detail=auth_detail
                     )
+                )
+
+            if has_invalid_ref:
+                results.append(
+                    ValidationResult(
+                        hypothesis_id=hyp.id,
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message="Eligibility check failed: Evidence reference failed to resolve or is fabricated"
+                    )
+                )
+                continue
+
             canonical_references.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
 
             # Hypotheses passed to sandbox contains strictly canonicalized authoritative evidence
