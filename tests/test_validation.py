@@ -818,5 +818,77 @@ class TestSandboxValidation(unittest.TestCase):
         # Ensure the hypothesis NEVER reaches the sandbox
         self.assertEqual(len(validator.last_validated), 0)
 
+
+
+    def test_trueforge_validator_local_sandbox_success(self):
+        """Verify that local sandbox subprocess execution validates a hypothesis successfully."""
+        validator = TrueForgeSandboxValidator(local_sandbox=True)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(results.status, ValidationStatus.VALIDATED)
+        self.assertTrue(results.attempted)
+        self.assertTrue(results.confirmed)
+        self.assertIn("Sandbox harness initialized", results.stdout)
+
+    def test_trueforge_validator_timeout(self):
+        """Verify that validator timeout terminates the subprocess and returns TIMEOUT."""
+        validator = TrueForgeSandboxValidator(local_sandbox=True, timeout_seconds=0.00001)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(results.status, ValidationStatus.TIMEOUT)
+        self.assertTrue(results.attempted)
+        self.assertFalse(results.confirmed)
+        self.assertIn("timed out", results.error_message)
+
+    def test_trueforge_validator_preflight(self):
+        """Verify configuration preflight check fails when TRUEFORGE_API_KEY is missing."""
+        validator = TrueForgeSandboxValidator(api_key=None, local_sandbox=False)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(results.status, ValidationStatus.PREFLIGHT_ERROR)
+        self.assertFalse(results.attempted)
+        self.assertFalse(results.confirmed)
+        self.assertIn("Missing TRUEFORGE_API_KEY", results.error_message)
+
+    def test_trueforge_validator_remote_api(self):
+        """Verify remote API client setup simulated response."""
+        validator = TrueForgeSandboxValidator(api_key="test-key", local_sandbox=False)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(results.status, ValidationStatus.VALIDATED)
+        self.assertTrue(results.attempted)
+        self.assertTrue(results.confirmed)
+        self.assertEqual(results.metadata.get("endpoint"), "https://api.trueforge.example.com")
+
+    @patch("subprocess.Popen")
+    def test_trueforge_validator_malformed_json(self, mock_popen):
+        """Verify malformed validator stdout is caught as SANDBOX_ERROR."""
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("this is not json", "some error")
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        validator = TrueForgeSandboxValidator(local_sandbox=True)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(results.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertTrue(results.attempted)
+        self.assertIn("not valid JSON", results.error_message)
+
+    @patch("subprocess.Popen")
+    def test_trueforge_validator_exit_error(self, mock_popen):
+        """Verify non-zero subprocess return code is caught as SANDBOX_ERROR."""
+        mock_proc = MagicMock()
+        mock_proc.communicate.return_value = ("", "Critical crash in sandbox process")
+        mock_proc.returncode = 1
+        mock_popen.return_value = mock_proc
+
+        validator = TrueForgeSandboxValidator(local_sandbox=True)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(results.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertTrue(results.attempted)
+        self.assertIn("process exited with code 1", results.error_message)
+
 if __name__ == "__main__":
     unittest.main()
