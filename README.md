@@ -93,7 +93,7 @@ $env:PYTHONPATH="src"; python -m unittest discover -s tests
 Or with `pytest`:
 
 ```bash
-pytest tests/
+python -m pytest tests/
 ```
 
 ---
