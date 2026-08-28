@@ -825,9 +825,9 @@ class TestSandboxValidation(unittest.TestCase):
         validator = TrueForgeSandboxValidator(local_sandbox=True)
         results = validator.validate(self.valid_hyp, self.report)
 
-        self.assertEqual(results.status, ValidationStatus.VALIDATED)
+        self.assertEqual(results.status, ValidationStatus.NOT_CONFIRMED)
         self.assertTrue(results.attempted)
-        self.assertTrue(results.confirmed)
+        self.assertFalse(results.confirmed)
         self.assertIn("Sandbox harness initialized", results.stdout)
 
     def test_trueforge_validator_timeout(self):
@@ -855,16 +855,19 @@ class TestSandboxValidation(unittest.TestCase):
         validator = TrueForgeSandboxValidator(api_key="test-key", local_sandbox=False)
         results = validator.validate(self.valid_hyp, self.report)
 
-        self.assertEqual(results.status, ValidationStatus.VALIDATED)
-        self.assertTrue(results.attempted)
-        self.assertTrue(results.confirmed)
-        self.assertEqual(results.metadata.get("endpoint"), "https://api.trueforge.example.com")
+        self.assertEqual(results.status, ValidationStatus.NOT_ATTEMPTED)
+        self.assertFalse(results.attempted)
+        self.assertFalse(results.confirmed)
+        self.assertEqual(results.confidence_delta, 0.0)
+        self.assertIn("deferred", results.error_message)
 
     @patch("subprocess.Popen")
     def test_trueforge_validator_malformed_json(self, mock_popen):
         """Verify malformed validator stdout is caught as SANDBOX_ERROR."""
         mock_proc = MagicMock()
-        mock_proc.communicate.return_value = ("this is not json", "some error")
+        mock_proc.stdout.read.side_effect = ["this is not json", ""]
+        mock_proc.stderr.read.side_effect = ["some error", ""]
+        mock_proc.poll.return_value = 0
         mock_proc.returncode = 0
         mock_popen.return_value = mock_proc
 
@@ -879,7 +882,9 @@ class TestSandboxValidation(unittest.TestCase):
     def test_trueforge_validator_exit_error(self, mock_popen):
         """Verify non-zero subprocess return code is caught as SANDBOX_ERROR."""
         mock_proc = MagicMock()
-        mock_proc.communicate.return_value = ("", "Critical crash in sandbox process")
+        mock_proc.stdout.read.side_effect = ["", ""]
+        mock_proc.stderr.read.side_effect = ["Critical crash in sandbox process", ""]
+        mock_proc.poll.return_value = 0
         mock_proc.returncode = 1
         mock_popen.return_value = mock_proc
 
@@ -889,6 +894,161 @@ class TestSandboxValidation(unittest.TestCase):
         self.assertEqual(results.status, ValidationStatus.SANDBOX_ERROR)
         self.assertTrue(results.attempted)
         self.assertIn("process exited with code 1", results.error_message)
+
+    def test_trueforge_validator_path_resolution_and_containment(self):
+        """Verify path containment, missing files, and directory traversal escapes in the local sandbox."""
+        import tempfile
+        import shutil
+        import os
+
+        # Set up temporary repository directory
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir_abs = os.path.abspath(temp_dir)
+
+            # Create a mock code file inside
+            src_dir = os.path.join(temp_dir_abs, "src")
+            os.makedirs(src_dir, exist_ok=True)
+            server_file = os.path.join(src_dir, "server.py")
+            with open(server_file, "w", encoding="utf-8") as f:
+                f.write("import subprocess\nsubprocess.run(['ls'])\n")
+
+            # Construct RepositorySummary and Report pointing to temp_dir
+            temp_summary = RepositorySummary(
+                root=temp_dir_abs,
+                total_files=1,
+                total_directories=1,
+                languages={"Python": 1},
+                frameworks=["Flask"],
+                ecosystems=[],
+                config_files=[],
+                docker_configs=[],
+                cicd_configs=[],
+                infrastructure_configs=[],
+                test_files=[]
+            )
+            temp_report = RepositoryReport(
+                repository=temp_summary,
+                routes=[RouteCandidate(file="src/server.py", line=1, method="POST", pattern="/run", evidence="")],
+                security_indicators=[
+                    SecurityIndicator(
+                        category="subprocess",
+                        indicator_type="subprocess_execution_indicator",
+                        file="src/server.py",
+                        line=2,
+                        evidence="subprocess.run"
+                    )
+                ]
+            )
+
+            det_engine = DeterministicReasoningEngine()
+            det_report = det_engine.generate_hypotheses(temp_report)
+            hyp = det_report.hypotheses[0]
+
+            validator = TrueForgeSandboxValidator(local_sandbox=True)
+
+            # A. Valid relative file resolves and confirms successfully
+            results = validator.validate(hyp, temp_report)
+            self.assertEqual(results.status, ValidationStatus.VALIDATED)
+            self.assertTrue(results.confirmed)
+            self.assertIn("Found evidence", results.evidence)
+
+            # B. Missing file must return NOT_CONFIRMED (do not fabricate confirmation)
+            # Delete server.py
+            os.remove(server_file)
+            results_missing = validator.validate(hyp, temp_report)
+            self.assertEqual(results_missing.status, ValidationStatus.NOT_CONFIRMED)
+            self.assertFalse(results_missing.confirmed)
+
+            # C. Traversal attack: verify resolving outside sandbox root fails closed
+            traversal_indicator = SecurityIndicator(
+                category="subprocess",
+                indicator_type="subprocess_execution_indicator",
+                file="../escaped_file.py",
+                line=2,
+                evidence="subprocess.run"
+            )
+            temp_report_traversal = RepositoryReport(
+                repository=temp_summary,
+                routes=temp_report.routes,
+                security_indicators=[traversal_indicator]
+            )
+            # Reconstruct hypothesis using traversal references
+            traversal_refs = [
+                EvidenceReference(type="security_indicator", file="../escaped_file.py", line=2, detail="Subprocess call: subprocess.run"),
+                EvidenceReference(type="route", file="src/server.py", line=1, detail="Route: POST /run")
+            ]
+            traversal_hyp = SecurityHypothesis(
+                id=hyp.id,
+                title=hyp.title,
+                description=hyp.description,
+                category=hyp.category,
+                severity=hyp.severity,
+                confidence=hyp.confidence,
+                evidence_references=traversal_refs,
+                rationale=hyp.rationale
+            )
+
+            results_traversal = validator.validate(traversal_hyp, temp_report_traversal)
+            self.assertEqual(results_traversal.status, ValidationStatus.SANDBOX_ERROR)
+            self.assertFalse(results_traversal.confirmed)
+            self.assertIn("path escape detected", results_traversal.error_message)
+
+    @patch("subprocess.Popen")
+    def test_trueforge_validator_output_overflow(self, mock_popen):
+        """Verify that subprocess emitting combined output larger than limit is terminated."""
+        mock_proc = MagicMock()
+        # Mock stdout to return data once and then EOF to let the reader thread exit cleanly
+        mock_proc.stdout.read.side_effect = ["A" * 1024, ""]
+        mock_proc.stderr.read.side_effect = ["", ""]
+        mock_proc.poll.return_value = None  # process is running
+        mock_popen.return_value = mock_proc
+
+        validator = TrueForgeSandboxValidator(local_sandbox=True, max_output_bytes=100)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        # Verify Popen.kill was executed
+        mock_proc.kill.assert_called_once()
+        self.assertEqual(results.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertIn("combined output size exceeded limit", results.error_message)
+
+    @patch("subprocess.Popen")
+    def test_trueforge_validator_schema_validation(self, mock_popen):
+        """Verify schema/type checks for the deserialized sandbox JSON response."""
+        cases = [
+            # 1. Output is list instead of dictionary
+            ("[]", "JSON is not a dictionary"),
+            # 2. Output is null
+            ("null", "JSON is not a dictionary"),
+            # 3. Invalid confidence_delta type
+            ('{"status": "VALIDATED", "attempted": true, "confirmed": true, "confidence_delta": "invalid-string", "evidence": "", "stdout": "", "stderr": ""}', "confidence_delta field must be a float or int"),
+            # 4. confidence_delta is boolean
+            ('{"status": "VALIDATED", "attempted": true, "confirmed": true, "confidence_delta": true, "evidence": "", "stdout": "", "stderr": ""}', "confidence_delta field must be a float or int"),
+            # 5. confidence_delta is NaN
+            ('{"status": "VALIDATED", "attempted": true, "confirmed": true, "confidence_delta": NaN, "evidence": "", "stdout": "", "stderr": ""}', "nan"),
+            # 6. metadata is not dictionary
+            ('{"status": "VALIDATED", "attempted": true, "confirmed": true, "confidence_delta": 0.5, "metadata": [], "evidence": "", "stdout": "", "stderr": ""}', "metadata must be a dictionary"),
+            # 7. attempted is string instead of boolean
+            ('{"status": "VALIDATED", "attempted": "true", "confirmed": true, "confidence_delta": 0.5, "evidence": "", "stdout": "", "stderr": ""}', "attempted and confirmed fields must be exactly booleans"),
+            # 8. confirmed is integer instead of boolean
+            ('{"status": "VALIDATED", "attempted": true, "confirmed": 1, "confidence_delta": 0.5, "evidence": "", "stdout": "", "stderr": ""}', "attempted and confirmed fields must be exactly booleans"),
+            # 9. status is invalid status string
+            ('{"status": "FAKE_STATUS", "attempted": true, "confirmed": true, "confidence_delta": 0.5, "evidence": "", "stdout": "", "stderr": ""}', "invalid status"),
+        ]
+
+        for stdout_str, expected_err in cases:
+            mock_proc = MagicMock()
+            mock_proc.stdout.read.side_effect = [stdout_str, ""]
+            mock_proc.stderr.read.side_effect = ["", ""]
+            mock_proc.poll.return_value = 0
+            mock_proc.returncode = 0
+            mock_popen.return_value = mock_proc
+
+            validator = TrueForgeSandboxValidator(local_sandbox=True)
+            results = validator.validate(self.valid_hyp, self.report)
+
+            self.assertEqual(results.status, ValidationStatus.SANDBOX_ERROR)
+            self.assertTrue(results.attempted)
+            self.assertIn(expected_err, results.error_message)
 
 if __name__ == "__main__":
     unittest.main()

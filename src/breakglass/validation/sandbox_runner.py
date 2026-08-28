@@ -27,22 +27,57 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
     report = payload.get("report", {})
 
     hyp_id = hypothesis.get("id", "")
-    category = hypothesis.get("category", "")
     refs = hypothesis.get("evidence_references", [])
+
+    # Retrieve and normalize the sandbox/repository root
+    repo_info = report.get("repository", {})
+    if not isinstance(repo_info, dict):
+        return {
+            "hypothesis_id": hyp_id,
+            "status": "SANDBOX_ERROR",
+            "attempted": True,
+            "confirmed": False,
+            "confidence_delta": 0.0,
+            "evidence": "",
+            "stdout": "",
+            "stderr": "",
+            "metadata": {},
+            "error_message": "Missing repository summary object"
+        }
+
+    sandbox_root = repo_info.get("root")
+    if not isinstance(sandbox_root, str) or not sandbox_root.strip():
+        return {
+            "hypothesis_id": hyp_id,
+            "status": "SANDBOX_ERROR",
+            "attempted": True,
+            "confirmed": False,
+            "confidence_delta": 0.0,
+            "evidence": "",
+            "stdout": "",
+            "stderr": "",
+            "metadata": {},
+            "error_message": "Missing or invalid repository root directory path"
+        }
+
+    sandbox_root_abs = os.path.abspath(sandbox_root)
 
     # Simple validation rule check: check if code exists and contains the evidence
     indicators = report.get("security_indicators", [])
-    
+    if not isinstance(indicators, list):
+        indicators = []
+
     confirmed = False
     details_log = []
 
     # Map references
-    ind_ref = next((r for r in refs if r.get("type") == "security_indicator"), None)
+    ind_ref = next((r for r in refs if isinstance(r, dict) and r.get("type") == "security_indicator"), None)
     if ind_ref:
         # Find matching indicator
         ind = next((
             i for i in indicators
-            if i.get("file") == ind_ref.get("file")
+            if isinstance(i, dict)
+            and i.get("file") == ind_ref.get("file")
             and (i.get("line") == ind_ref.get("line") or (i.get("line") is None and ind_ref.get("line") is None))
             and match_indicator_detail(i, ind_ref.get("detail", ""))
         ), None)
@@ -50,13 +85,28 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
         if ind:
             evidence_str = ind.get("evidence", "")
             file_path = ind.get("file", "")
-            
-            # Subprocess/sandbox check: verify the file exists on disk (if target repo is local)
-            # In a real sandbox, the repo files are mounted/copied.
-            # We verify the file is readable and contains the evidence.
-            if os.path.exists(file_path):
+
+            # Subprocess/sandbox check: verify the file exists on disk inside sandbox root
+            resolved_path = os.path.abspath(os.path.join(sandbox_root_abs, file_path))
+
+            # Enforce sandbox boundary containment to reject path traversal escapes
+            if not (resolved_path.startswith(sandbox_root_abs + os.sep) or resolved_path == sandbox_root_abs):
+                return {
+                    "hypothesis_id": hyp_id,
+                    "status": "SANDBOX_ERROR",
+                    "attempted": True,
+                    "confirmed": False,
+                    "confidence_delta": 0.0,
+                    "evidence": "",
+                    "stdout": "",
+                    "stderr": "",
+                    "metadata": {},
+                    "error_message": f"Security violation: path escape detected resolving '{file_path}' outside sandbox root"
+                }
+
+            if os.path.exists(resolved_path) and os.path.isfile(resolved_path):
                 try:
-                    with open(file_path, "r", encoding="utf-8") as f:
+                    with open(resolved_path, "r", encoding="utf-8") as f:
                         lines = f.readlines()
                     line_idx = ind.get("line")
                     if line_idx is not None and 1 <= line_idx <= len(lines):
@@ -75,11 +125,23 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
                         else:
                             details_log.append(f"Evidence '{evidence_str}' not found in file {file_path}")
                 except Exception as e:
-                    details_log.append(f"Failed to read file {file_path}: {str(e)}")
+                    # Fail closed on read errors
+                    return {
+                        "hypothesis_id": hyp_id,
+                        "status": "SANDBOX_ERROR",
+                        "attempted": True,
+                        "confirmed": False,
+                        "confidence_delta": 0.0,
+                        "evidence": "",
+                        "stdout": "",
+                        "stderr": "",
+                        "metadata": {},
+                        "error_message": f"Failed to read file {file_path}: {str(e)}"
+                    }
             else:
-                # If file doesn't exist, we can fallback to validating by report indicators presence
-                confirmed = True
-                details_log.append(f"Validated by report indicators presence: {ind}")
+                # If file does not exist, return NOT_CONFIRMED (do not fabricate confirmation!)
+                confirmed = False
+                details_log.append(f"Evidence file does not exist: {file_path}")
 
     if confirmed:
         status = "VALIDATED"
@@ -113,10 +175,15 @@ def main():
                 "status": "SANDBOX_ERROR",
                 "attempted": True,
                 "confirmed": False,
+                "confidence_delta": 0.0,
+                "evidence": "",
+                "stdout": "",
+                "stderr": "",
+                "metadata": {},
                 "error_message": "Empty input payload"
             }))
             sys.exit(1)
-            
+
         payload = json.loads(raw_input)
         result = run_validation(payload)
         print(json.dumps(result))
@@ -126,6 +193,11 @@ def main():
             "status": "SANDBOX_ERROR",
             "attempted": True,
             "confirmed": False,
+            "confidence_delta": 0.0,
+            "evidence": "",
+            "stdout": "",
+            "stderr": "",
+            "metadata": {},
             "error_message": f"Sandbox runner execution error: {str(e)}"
         }))
         sys.exit(1)

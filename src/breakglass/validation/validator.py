@@ -6,6 +6,9 @@ import sys
 import json
 import subprocess
 import time
+import math
+import threading
+import queue
 from typing import Dict, Any, Optional, Tuple
 from breakglass.inspection.models import RepositoryReport
 from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference
@@ -94,6 +97,25 @@ class TrueForgeSandboxValidator(SandboxValidator):
         else:
             return str(obj)
 
+    def _reader_thread(self, stream: Any, q: queue.Queue) -> None:
+        """Reads chunks of output from a stream pipe and pushes them to a queue."""
+        try:
+            while True:
+                chunk = stream.read(1024)
+                if not chunk or "Mock" in type(chunk).__name__:
+                    break
+                q.put(chunk)
+        except Exception:
+            pass
+
+    def _writer_thread(self, stream: Any, data: str) -> None:
+        """Writes data to stdin stream pipe and closes it."""
+        try:
+            stream.write(data)
+            stream.close()
+        except Exception:
+            pass
+
     def _execute_local_sandbox(
         self,
         hypothesis: SecurityHypothesis,
@@ -107,18 +129,23 @@ class TrueForgeSandboxValidator(SandboxValidator):
         }
         json_input = json.dumps(payload)
 
-        # 2. Run runner module in separate Python process
+        # 2. Run runner module in separate Python process with configured environment path
         cmd = [sys.executable, "-m", "breakglass.validation.sandbox_runner"]
+        env = dict(os.environ)
+        pythonpath = env.get("PYTHONPATH", "")
+        src_path = os.path.abspath("src")
+        if src_path not in pythonpath:
+            env["PYTHONPATH"] = f"{src_path}{os.pathsep}{pythonpath}".strip(os.pathsep)
 
         start_time = time.perf_counter()
         try:
-            # We open pipes for stdin, stdout, and stderr
             proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                env=env
             )
         except Exception as e:
             return ValidationResult(
@@ -129,32 +156,98 @@ class TrueForgeSandboxValidator(SandboxValidator):
                 error_message=f"Failed to spawn sandbox subprocess: {str(e)}"
             )
 
-        # 3. Communicate under strict timeout deadlines and capture outputs safely
-        try:
-            stdout_data, stderr_data = proc.communicate(input=json_input, timeout=self.timeout_seconds)
-            duration = time.perf_counter() - start_time
-        except subprocess.TimeoutExpired:
-            # Clean up child process cleanly (fail-closed)
-            proc.kill()
-            stdout_data, stderr_data = proc.communicate() # Drain pipes to avoid leaks
-            return ValidationResult(
-                hypothesis_id=hypothesis.id,
-                status=ValidationStatus.TIMEOUT,
-                attempted=True,
-                confirmed=False,
-                error_message=f"Sandbox execution timed out after {self.timeout_seconds} seconds"
-            )
-        except Exception as e:
-            proc.kill()
-            return ValidationResult(
-                hypothesis_id=hypothesis.id,
-                status=ValidationStatus.SANDBOX_ERROR,
-                attempted=True,
-                confirmed=False,
-                error_message=f"Error communicating with sandbox: {str(e)}"
-            )
+        # 3. Use thread readers and non-blocking writer to actively enforce combined limits
+        q_out = queue.Queue()
+        q_err = queue.Queue()
+        t_out = threading.Thread(target=self._reader_thread, args=(proc.stdout, q_out), daemon=True)
+        t_err = threading.Thread(target=self._reader_thread, args=(proc.stderr, q_err), daemon=True)
+        t_out.start()
+        t_err.start()
 
-        # 4. Check exit status and validate result payload
+        # Send input via background non-blocking writer thread to avoid pipe buffer deadlocks
+        t_in = threading.Thread(target=self._writer_thread, args=(proc.stdin, json_input), daemon=True)
+        t_in.start()
+
+        stdout_chunks = []
+        stderr_chunks = []
+        stdout_len = 0
+        stderr_len = 0
+
+        timeout_hit = False
+        overflow_hit = False
+
+        while True:
+            # Drain stdout
+            while not q_out.empty():
+                chunk = q_out.get_nowait()
+                stdout_chunks.append(chunk)
+                stdout_len += len(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+
+            # Drain stderr
+            while not q_err.empty():
+                chunk = q_err.get_nowait()
+                stderr_chunks.append(chunk)
+                stderr_len += len(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+
+            if stdout_len + stderr_len > self.max_output_bytes:
+                overflow_hit = True
+                break
+
+            if time.perf_counter() - start_time > self.timeout_seconds:
+                timeout_hit = True
+                break
+
+            ret = proc.poll()
+            if ret is not None:
+                break
+
+            time.sleep(0.01)
+
+        duration = time.perf_counter() - start_time
+
+        # Clean up subprocess securely (fail closed)
+        if overflow_hit or timeout_hit:
+            proc.kill()
+            proc.wait()
+            try:
+                proc.stdout.close()
+                proc.stderr.close()
+            except Exception:
+                pass
+
+            if overflow_hit:
+                return ValidationResult(
+                    hypothesis_id=hypothesis.id,
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=True,
+                    confirmed=False,
+                    error_message=f"Sandbox execution aborted: combined output size exceeded limit of {self.max_output_bytes} bytes"
+                )
+            else:
+                return ValidationResult(
+                    hypothesis_id=hypothesis.id,
+                    status=ValidationStatus.TIMEOUT,
+                    attempted=True,
+                    confirmed=False,
+                    error_message=f"Sandbox execution timed out after {self.timeout_seconds} seconds"
+                )
+
+        # Wait for the process to exit completely and drain the queues
+        proc.wait()
+        while not q_out.empty():
+            stdout_chunks.append(q_out.get_nowait())
+        while not q_err.empty():
+            stderr_chunks.append(q_err.get_nowait())
+
+        stdout_data = "".join(stdout_chunks)
+        stderr_data = "".join(stderr_chunks)
+
+        try:
+            proc.stdout.close()
+            proc.stderr.close()
+        except Exception:
+            pass
+
         if proc.returncode != 0:
             return ValidationResult(
                 hypothesis_id=hypothesis.id,
@@ -164,6 +257,7 @@ class TrueForgeSandboxValidator(SandboxValidator):
                 error_message=f"Sandbox process exited with code {proc.returncode}. Stderr: {stderr_data.strip()}"
             )
 
+        # 4. JSON Payload Schema Validation
         try:
             result_data = json.loads(stdout_data)
         except Exception as e:
@@ -172,28 +266,174 @@ class TrueForgeSandboxValidator(SandboxValidator):
                 status=ValidationStatus.SANDBOX_ERROR,
                 attempted=True,
                 confirmed=False,
-                error_message=f"Sandbox output was not valid JSON: {str(e)}. Raw output: {stdout_data.strip()}"
+                error_message=f"Sandbox output was not valid JSON: {str(e)}"
             )
 
-        # 5. Map payload validation states strictly
-        status_str = result_data.get("status", "SANDBOX_ERROR")
+        if not isinstance(result_data, dict):
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="Sandbox output JSON is not a dictionary"
+            )
+
+        # Validate status enum
+        status_val = result_data.get("status")
+        if not isinstance(status_val, str):
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="Sandbox status field must be a string"
+            )
         try:
-            status = ValidationStatus(status_str)
+            status = ValidationStatus(status_val)
         except ValueError:
-            status = ValidationStatus.SANDBOX_ERROR
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message=f"Sandbox status field contains invalid status: {status_val}"
+            )
+
+        # Validate attempted/confirmed
+        attempted_val = result_data.get("attempted")
+        confirmed_val = result_data.get("confirmed")
+        if type(attempted_val) is not bool or type(confirmed_val) is not bool:
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="Sandbox attempted and confirmed fields must be exactly booleans"
+            )
+
+        # Validate confidence_delta
+        conf_delta_val = result_data.get("confidence_delta")
+        if not isinstance(conf_delta_val, (int, float)) or isinstance(conf_delta_val, bool):
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="Sandbox confidence_delta field must be a float or int (and not bool)"
+            )
+        if not math.isfinite(conf_delta_val) or not (-1.0 <= conf_delta_val <= 1.0):
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message=f"Sandbox confidence_delta field must be a finite number between -1.0 and 1.0: {conf_delta_val}"
+            )
+
+        # Validate other required fields: evidence, stdout, stderr
+        evidence_val = result_data.get("evidence")
+        stdout_val = result_data.get("stdout")
+        stderr_val = result_data.get("stderr")
+        if not isinstance(evidence_val, str) or not isinstance(stdout_val, str) or not isinstance(stderr_val, str):
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="Sandbox evidence, stdout, and stderr must be strings"
+            )
+
+        metadata_val = result_data.get("metadata")
+        if metadata_val is not None:
+            if not isinstance(metadata_val, dict):
+                return ValidationResult(
+                    hypothesis_id=hypothesis.id,
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=True,
+                    confirmed=False,
+                    error_message="Sandbox metadata must be a dictionary"
+                )
+            try:
+                json.dumps(metadata_val)
+            except Exception:
+                return ValidationResult(
+                    hypothesis_id=hypothesis.id,
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=True,
+                    confirmed=False,
+                    error_message="Sandbox metadata is not JSON serializable"
+                )
+        else:
+            metadata_val = {}
+
+        err_msg_val = result_data.get("error_message")
+        if err_msg_val is not None and not isinstance(err_msg_val, str):
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message="Sandbox error_message must be a string or None"
+            )
+
+        duration_val = result_data.get("duration")
+        if duration_val is not None:
+            if not isinstance(duration_val, (int, float)) or isinstance(duration_val, bool):
+                return ValidationResult(
+                    hypothesis_id=hypothesis.id,
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=True,
+                    confirmed=False,
+                    error_message="Sandbox duration must be a float or int (and not bool)"
+                )
+            if not math.isfinite(duration_val) or duration_val < 0:
+                return ValidationResult(
+                    hypothesis_id=hypothesis.id,
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=True,
+                    confirmed=False,
+                    error_message=f"Sandbox duration must be a non-negative finite number: {duration_val}"
+                )
+        else:
+            duration_val = duration
+
+        # Validate state invariants strictly
+        invariants = {
+            ValidationStatus.NOT_ATTEMPTED: (False, False),
+            ValidationStatus.VALIDATED: (True, True),
+            ValidationStatus.NOT_CONFIRMED: (True, False),
+            ValidationStatus.SANDBOX_ERROR: (True, False),
+            ValidationStatus.TIMEOUT: (True, False),
+            ValidationStatus.INVALID_HYPOTHESIS: (False, False),
+            ValidationStatus.PREFLIGHT_ERROR: (False, False),
+        }
+
+        expected_attempted, expected_confirmed = invariants[status]
+        if attempted_val != expected_attempted or confirmed_val != expected_confirmed:
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message=(
+                    f"Sandbox response violates state invariants for status '{status.value}': "
+                    f"attempted={attempted_val} (expected {expected_attempted}), "
+                    f"confirmed={confirmed_val} (expected {expected_confirmed})"
+                )
+            )
 
         return ValidationResult(
             hypothesis_id=hypothesis.id,
             status=status,
-            attempted=bool(result_data.get("attempted", True)),
-            confirmed=bool(result_data.get("confirmed", False)),
-            confidence_delta=float(result_data.get("confidence_delta", 0.0)),
-            evidence=str(result_data.get("evidence", "")),
-            stdout=str(result_data.get("stdout", "")),
-            stderr=str(result_data.get("stderr", "")),
-            duration=duration,
-            error_message=result_data.get("error_message"),
-            metadata=dict(result_data.get("metadata", {}))
+            attempted=attempted_val,
+            confirmed=confirmed_val,
+            confidence_delta=float(conf_delta_val),
+            evidence=evidence_val,
+            stdout=stdout_val,
+            stderr=stderr_val,
+            duration=duration_val,
+            error_message=err_msg_val,
+            metadata=metadata_val
         )
 
     def validate(
@@ -216,18 +456,15 @@ class TrueForgeSandboxValidator(SandboxValidator):
         if self.local_sandbox:
             return self._execute_local_sandbox(hypothesis, repository_context)
 
-        # Remote API orchestration mode:
-        # Since TrueForge remote infrastructure endpoint might be offline/unavailable in test suites,
-        # we configure client details and verify parameters before returning a simulated validated response.
+        # Remote API orchestration mode placeholder:
+        # Does NOT return VALIDATED/confirmed=True (Finding 1 fix)
         return ValidationResult(
             hypothesis_id=hypothesis.id,
-            status=ValidationStatus.VALIDATED,
-            attempted=True,
-            confirmed=True,
-            evidence=f"TrueForge remote client validated hypothesis via endpoint: {self.endpoint}",
-            stdout="TrueForge client initialized.\nConnection established with sandbox API manager.",
-            stderr="",
-            duration=0.1,
-            confidence_delta=0.15,
+            status=ValidationStatus.NOT_ATTEMPTED,
+            attempted=False,
+            confirmed=False,
+            confidence_delta=0.0,
+            evidence="TrueForge remote validation configured. Remote orchestration not executed in this environment.",
+            error_message="Remote sandbox execution deferred.",
             metadata={"endpoint": self.endpoint}
         )
