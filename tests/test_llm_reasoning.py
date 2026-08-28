@@ -27,7 +27,7 @@ class TestLLMReasoning(unittest.TestCase):
             languages={},
             frameworks=[],
             ecosystems=[],
-            config_files=[],
+            config_files=["config.json"],
             docker_configs=[],
             cicd_configs=[],
             infrastructure_configs=[],
@@ -73,13 +73,13 @@ class TestLLMReasoning(unittest.TestCase):
                             "type": "route",
                             "file": "src/server.py",
                             "line": 12,
-                            "detail": "FastAPI Route"
+                            "detail": "LLM Detail (Fabricated detail)"
                         },
                         {
                             "type": "security_indicator",
                             "file": "src/server.py",
                             "line": 15,
-                            "detail": "subprocess.run execution"
+                            "detail": "LLM Detail 2 (Fabricated detail 2)"
                         }
                     ]
                 }
@@ -94,11 +94,76 @@ class TestLLMReasoning(unittest.TestCase):
         self.assertEqual(len(res.hypotheses), 1)
 
         hyp = res.hypotheses[0]
-        self.assertEqual(hyp.id, "HYP-LLM-001")
+        self.assertTrue(hyp.id.startswith("HYP-LLM-COMMAND-INJECTION-"))
         self.assertEqual(hyp.category, "command_injection")
         self.assertEqual(hyp.severity, "HIGH")
         self.assertEqual(hyp.confidence, 0.85)
         self.assertEqual(len(hyp.evidence_references), 2)
+
+        # Verify that LLM-provided details are replaced by authoritative report details
+        details = {ref.detail for ref in hyp.evidence_references}
+        self.assertIn("Route: POST /run-task", details)
+        self.assertIn("Security indicator: subprocess.run(...)", details)
+        self.assertNotIn("LLM Detail (Fabricated detail)", details)
+
+    def test_malformed_json_members_prevent_crashes(self):
+        """Verify that malformed JSON member types (null, strings, integers) in hypotheses do not crash the engine."""
+        cases = [
+            {"hypotheses": [None]},
+            {"hypotheses": ["invalid_string"]},
+            {"hypotheses": [12345]},
+            {"hypotheses": [[]]},
+            {
+                "hypotheses": [
+                    {
+                        "id": "HYP-LLM-001",
+                        "title": "Title",
+                        "description": "Desc",
+                        "category": "command_injection",
+                        "severity": "HIGH",
+                        "confidence": 0.85,
+                        "rationale": "Rationale",
+                        "evidence_references": [None]  # null reference member
+                    }
+                ]
+            },
+            {
+                "hypotheses": [
+                    {
+                        "id": "HYP-LLM-001",
+                        "title": "Title",
+                        "description": "Desc",
+                        "category": "command_injection",
+                        "severity": "HIGH",
+                        "confidence": 0.85,
+                        "rationale": "Rationale",
+                        "evidence_references": ["invalid_ref_string"]  # string reference member
+                    }
+                ]
+            },
+            {
+                "hypotheses": [
+                    {
+                        "id": "HYP-LLM-001",
+                        "title": "Title",
+                        "description": "Desc",
+                        "category": "command_injection",
+                        "severity": "HIGH",
+                        "confidence": 0.85,
+                        "rationale": "Rationale",
+                        "evidence_references": [123]  # integer reference member
+                    }
+                ]
+            }
+        ]
+
+        for idx, payload in enumerate(cases):
+            client = MockLLMClient(response_text=json.dumps(payload))
+            engine = LLMReasoningEngine(client)
+            res = engine.analyze(self.report, self.det_report)
+            self.assertEqual(res.validation_status, "failed", f"Case #{idx} should have failed validation cleanly")
+            self.assertTrue(len(res.errors) > 0, f"Case #{idx} should have recorded validation errors")
+            self.assertEqual(len(res.hypotheses), 0, f"Case #{idx} should not produce any valid hypotheses")
 
     def test_malformed_json_rejected(self):
         """Test that invalid JSON is rejected safely."""
@@ -189,6 +254,95 @@ class TestLLMReasoning(unittest.TestCase):
         self.assertTrue(any("fabricated evidence" in err for err in res.errors))
         self.assertEqual(len(res.hypotheses), 0)
 
+    def test_file_type_line_validation(self):
+        """Verify that type='file' evidence is only accepted when line is null."""
+        # 1. Accepted case: line is null
+        res_ok = {
+            "hypotheses": [
+                {
+                    "id": "HYP-LLM-001",
+                    "title": "Title",
+                    "description": "Desc",
+                    "category": "command_injection",
+                    "severity": "HIGH",
+                    "confidence": 0.85,
+                    "rationale": "Rationale",
+                    "evidence_references": [
+                        {
+                            "type": "file",
+                            "file": "config.json",
+                            "line": None,
+                            "detail": "detail"
+                        }
+                    ]
+                }
+            ]
+        }
+        client = MockLLMClient(response_text=json.dumps(res_ok))
+        engine = LLMReasoningEngine(client)
+        res = engine.analyze(self.report, self.det_report)
+        self.assertEqual(res.validation_status, "success")
+        self.assertEqual(len(res.hypotheses), 1)
+        self.assertEqual(res.hypotheses[0].evidence_references[0].line, None)
+
+        # 2. Rejected case: line is not null
+        res_fail_line = {
+            "hypotheses": [
+                {
+                    "id": "HYP-LLM-001",
+                    "title": "Title",
+                    "description": "Desc",
+                    "category": "command_injection",
+                    "severity": "HIGH",
+                    "confidence": 0.85,
+                    "rationale": "Rationale",
+                    "evidence_references": [
+                        {
+                            "type": "file",
+                            "file": "config.json",
+                            "line": 42,  # Fabricated line number for a plain file reference
+                            "detail": "detail"
+                        }
+                    ]
+                }
+            ]
+        }
+        client_fail_line = MockLLMClient(response_text=json.dumps(res_fail_line))
+        engine.client = client_fail_line
+        res = engine.analyze(self.report, self.det_report)
+        self.assertEqual(res.validation_status, "failed")
+        self.assertTrue(any("fabricated evidence" in err for err in res.errors))
+        self.assertEqual(len(res.hypotheses), 0)
+
+        # 3. Rejected case: unknown file
+        res_fail_file = {
+            "hypotheses": [
+                {
+                    "id": "HYP-LLM-001",
+                    "title": "Title",
+                    "description": "Desc",
+                    "category": "command_injection",
+                    "severity": "HIGH",
+                    "confidence": 0.85,
+                    "rationale": "Rationale",
+                    "evidence_references": [
+                        {
+                            "type": "file",
+                            "file": "unknown_file.txt",
+                            "line": None,
+                            "detail": "detail"
+                        }
+                    ]
+                }
+            ]
+        }
+        client_fail_file = MockLLMClient(response_text=json.dumps(res_fail_file))
+        engine.client = client_fail_file
+        res = engine.analyze(self.report, self.det_report)
+        self.assertEqual(res.validation_status, "failed")
+        self.assertTrue(any("fabricated evidence" in err for err in res.errors))
+        self.assertEqual(len(res.hypotheses), 0)
+
     def test_duplicate_hypotheses_normalized(self):
         """Test that duplicate hypotheses are de-duplicated by ID."""
         response_data = {
@@ -204,13 +358,13 @@ class TestLLMReasoning(unittest.TestCase):
                     "evidence_references": []
                 },
                 {
-                    "id": "HYP-LLM-001",  # Duplicate ID
-                    "title": "Title 2",
-                    "description": "Desc 2",
+                    "id": "HYP-LLM-001",  # Same details will map to same ID anyway
+                    "title": "Title",
+                    "description": "Desc",
                     "category": "command_injection",
                     "severity": "HIGH",
                     "confidence": 0.85,
-                    "rationale": "Rationale 2",
+                    "rationale": "Rationale",
                     "evidence_references": []
                 }
             ]
@@ -249,13 +403,13 @@ class TestLLMReasoning(unittest.TestCase):
                             "type": "security_indicator",
                             "file": "src/server.py",
                             "line": 15,
-                            "detail": "subprocess.run execution"
+                            "detail": "detail"
                         },
                         {
                             "type": "route",
                             "file": "src/server.py",
                             "line": 12,
-                            "detail": "FastAPI Route"
+                            "detail": "detail"
                         }
                     ]
                 }
@@ -267,11 +421,11 @@ class TestLLMReasoning(unittest.TestCase):
 
         self.assertEqual(len(res.hypotheses), 2)
         # Check order of hypotheses (sorted by ID)
-        self.assertEqual(res.hypotheses[0].id, "HYP-LLM-001")
-        self.assertEqual(res.hypotheses[1].id, "HYP-LLM-002")
+        self.assertEqual(res.hypotheses[0].id, sorted([res.hypotheses[0].id, res.hypotheses[1].id])[0])
 
         # Check order of references (sorted by file, line, type, detail)
-        refs = res.hypotheses[0].evidence_references
+        hyp_with_refs = [h for h in res.hypotheses if h.evidence_references][0]
+        refs = hyp_with_refs.evidence_references
         self.assertEqual(refs[0].type, "route")
         self.assertEqual(refs[1].type, "security_indicator")
 
