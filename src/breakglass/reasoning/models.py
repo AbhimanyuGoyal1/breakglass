@@ -66,3 +66,14 @@ class ReasoningReport:
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent)
 
+
+def generate_hypothesis_id(category: str, identity: Dict[str, Any], is_llm: bool = False) -> str:
+    """Generates a stable, collision-resistant hypothesis ID using SHA-256."""
+    import hashlib
+    canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    prefix = "HYP-LLM" if is_llm else "HYP"
+    cat_prefix = f"{prefix}-{category.upper().replace('_', '-')}"
+    return f"{cat_prefix}-{digest[:16]}"
+
+

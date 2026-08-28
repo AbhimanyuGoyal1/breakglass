@@ -4,7 +4,7 @@ import json
 import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 from breakglass.inspection.models import RepositoryReport
-from breakglass.reasoning.models import ReasoningReport, SecurityHypothesis, EvidenceReference
+from breakglass.reasoning.models import ReasoningReport, SecurityHypothesis, EvidenceReference, generate_hypothesis_id
 from breakglass.llm.client import LLMClient
 from breakglass.llm.prompts import build_system_prompt, build_user_prompt
 
@@ -93,10 +93,7 @@ class LLMReasoningEngine:
             "description": description,
             "references": ref_list
         }
-        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        prefix = f"HYP-LLM-{category.upper().replace('_', '-')}"
-        return f"{prefix}-{digest[:16]}"
+        return generate_hypothesis_id(category, identity, is_llm=True)
 
     def analyze(
         self,

@@ -5,7 +5,8 @@ import hashlib
 import json
 from typing import Optional, Dict, Any, List
 from breakglass.inspection.models import RepositoryReport
-from breakglass.reasoning.models import ReasoningReport, SecurityHypothesis, EvidenceReference
+from breakglass.reasoning.models import ReasoningReport, SecurityHypothesis, EvidenceReference, generate_hypothesis_id
+import json
 
 
 class ReasoningEngine(ABC):
@@ -32,10 +33,7 @@ class DeterministicReasoningEngine(ReasoningEngine):
 
     def _generate_stable_id(self, category: str, identity: Dict[str, Any]) -> str:
         """Generates a stable, collision-resistant hypothesis ID using SHA-256."""
-        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        prefix = f"HYP-{category.upper().replace('_', '-')}"
-        return f"{prefix}-{digest[:16]}"
+        return generate_hypothesis_id(category, identity, is_llm=False)
 
     def _check_proximity(self, line1: Optional[int], line2: Optional[int]) -> bool:
         """Verifies if two line numbers are within the allowed MAX_LINE_DISTANCE."""

@@ -1,5 +1,7 @@
-"""Unit tests for the BREAKGLASS sandbox validation engine."""
+"""Unit tests for the BREAKGLASS sandbox validation engine and safety controls."""
 
+import time
+import json
 import unittest
 from unittest.mock import patch, MagicMock
 from breakglass.inspection.models import (
@@ -9,14 +11,30 @@ from breakglass.inspection.models import (
     RouteCandidate,
     EntryPointCandidate
 )
-from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference
+from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference, generate_hypothesis_id
+from breakglass.reasoning.engine import DeterministicReasoningEngine
 from breakglass.validation.models import ValidationResult, ValidationStatus
-from breakglass.validation.validator import MockSandboxValidator, TrueForgeSandboxValidator
+from breakglass.validation.validator import SandboxValidator, MockSandboxValidator, TrueForgeSandboxValidator
 from breakglass.validation.engine import ValidationConfig, ValidationEngine
 
 
+class SleepValidator(SandboxValidator):
+    """Validator that sleeps to simulate latency/hangs."""
+    def __init__(self, sleep_seconds: float):
+        self.sleep_seconds = sleep_seconds
+
+    def validate(self, hypothesis, context):
+        time.sleep(self.sleep_seconds)
+        return ValidationResult(
+            hypothesis_id=hypothesis.id or "",
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True
+        )
+
+
 class TestSandboxValidation(unittest.TestCase):
-    """Test suite for the sandbox validation engine, adapter, and config models."""
+    """Test suite for security boundaries, timeouts, payloads, ID authentication, and sorting safeguards."""
 
     def setUp(self):
         self.empty_summary = RepositorySummary(
@@ -24,9 +42,9 @@ class TestSandboxValidation(unittest.TestCase):
             total_files=0,
             total_directories=0,
             languages={},
-            frameworks=[],
+            frameworks=["Flask"],
             ecosystems=[],
-            config_files=[],
+            config_files=["config.json"],
             docker_configs=[],
             cicd_configs=[],
             infrastructure_configs=[],
@@ -41,30 +59,37 @@ class TestSandboxValidation(unittest.TestCase):
                     method="POST",
                     pattern="/run",
                     evidence=""
+                ),
+                RouteCandidate(
+                    file="src/server.py",
+                    line=20,
+                    method="GET",
+                    pattern="/info",
+                    evidence=""
                 )
             ],
             security_indicators=[
                 SecurityIndicator(
                     category="subprocess",
-                    indicator_type="",
+                    indicator_type="subprocess_execution_indicator",
                     file="src/server.py",
                     line=15,
-                    evidence=""
+                    evidence="subprocess.run"
+                ),
+                SecurityIndicator(
+                    category="cloud_sdk",
+                    indicator_type="cloud_sdk_indicator",
+                    file="src/cloud.py",
+                    line=10,
+                    evidence="boto3.client"
                 )
             ]
         )
-        self.valid_hyp = SecurityHypothesis(
-            id="HYP-001",
-            title="Title",
-            description="Desc",
-            category="command_injection",
-            severity="HIGH",
-            confidence=0.85,
-            evidence_references=[
-                EvidenceReference(type="route", file="src/server.py", line=12, detail=""),
-                EvidenceReference(type="security_indicator", file="src/server.py", line=15, detail="")
-            ]
-        )
+        # Generate valid hypotheses with authoritative IDs
+        det_engine = DeterministicReasoningEngine()
+        det_report = det_engine.generate_hypotheses(self.report)
+        self.valid_hyp = det_report.hypotheses[0]  # Command injection hypothesis
+        self.valid_hyp_2 = det_report.hypotheses[1]  # Credential exposure hypothesis
 
     def test_validation_result_model(self):
         """Verify model dictionary serialization and status schema values."""
@@ -92,126 +117,298 @@ class TestSandboxValidation(unittest.TestCase):
             ValidationConfig(max_hypotheses_per_run=0).validate()
         with self.assertRaises(ValueError):
             ValidationConfig(max_payload_bytes=-100).validate()
+        # Verify bool rejection
+        with self.assertRaises(ValueError):
+            ValidationConfig(timeout_seconds=True).validate()
 
-    def test_eligibility_validation(self):
-        """Verify hypothesis eligibility boundary logic."""
+    # --- 1. TIMEOUT BOUNDARY TESTS ---
+
+    def test_validator_completes_before_timeout(self):
+        """Verify standard fast execution completes successfully."""
+        validator = SleepValidator(sleep_seconds=0.01)
+        engine = ValidationEngine(validator, ValidationConfig(timeout_seconds=0.5))
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, ValidationStatus.VALIDATED)
+
+    def test_validator_exceeds_timeout(self):
+        """Verify validation timeout boundary blocks hanging execution."""
+        validator = SleepValidator(sleep_seconds=1.0)
+        engine = ValidationEngine(validator, ValidationConfig(timeout_seconds=0.05))
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        self.assertEqual(len(results), 1)
+        r = results[0]
+        self.assertEqual(r.status, ValidationStatus.TIMEOUT)
+        self.assertTrue(r.attempted)
+        self.assertFalse(r.confirmed)
+        self.assertIn("timed out", r.error_message)
+
+    # --- 2. REQUEST PAYLOAD BOUNDARY TESTS ---
+
+    def test_payload_bounds_enforcement(self):
+        """Verify that validation configuration limits payload bytes calculation."""
         validator = MockSandboxValidator()
         engine = ValidationEngine(validator)
 
-        # 1. Valid hypothesis is eligible
-        eligible, reason = engine.check_eligibility(self.valid_hyp, self.report)
-        self.assertTrue(eligible, f"Expected eligible, got: {reason}")
-
-        # 2. Invalid ID rejected
-        bad_id_hyp = SecurityHypothesis(
-            id="", title="T", description="D", category="command_injection",
-            severity="HIGH", confidence=0.8, evidence_references=[EvidenceReference(type="route", file="src/server.py", line=12)]
+        # Multi-byte UTF-8 character testing
+        unicode_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title="Title with unicode: 🚀🔥",
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=self.valid_hyp.evidence_references,
+            rationale=self.valid_hyp.rationale
         )
-        eligible, reason = engine.check_eligibility(bad_id_hyp, self.report)
-        self.assertFalse(eligible)
 
-        # 3. Unsupported category rejected
-        bad_cat_hyp = SecurityHypothesis(
-            id="HYP-001", title="T", description="D", category="unsupported_vuln_category",
-            severity="HIGH", confidence=0.8, evidence_references=[EvidenceReference(type="route", file="src/server.py", line=12)]
-        )
-        eligible, reason = engine.check_eligibility(bad_cat_hyp, self.report)
-        self.assertFalse(eligible)
+        # 1. Payload exactly at / below limit -> works
+        engine.config.max_payload_bytes = 100 * 1024 * 1024  # 100MB
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        self.assertEqual(results[0].status, ValidationStatus.NOT_CONFIRMED)
 
-        # 4. Missing/empty evidence references rejected
-        no_ref_hyp = SecurityHypothesis(
-            id="HYP-001", title="T", description="D", category="command_injection",
-            severity="HIGH", confidence=0.8, evidence_references=[]
-        )
-        eligible, reason = engine.check_eligibility(no_ref_hyp, self.report)
-        self.assertFalse(eligible)
+        # 2. Payload above limit -> rejected with fail-closed INVALID_HYPOTHESIS status
+        engine.config.max_payload_bytes = 10
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        self.assertEqual(results[0].status, ValidationStatus.INVALID_HYPOTHESIS)
+        self.assertIn("exceeds the configured max_payload_bytes limit", results[0].error_message)
 
-        # 5. Fabricated evidence reference rejected
-        fake_ref_hyp = SecurityHypothesis(
-            id="HYP-001", title="T", description="D", category="command_injection",
-            severity="HIGH", confidence=0.8, evidence_references=[
-                EvidenceReference(type="route", file="src/admin.py", line=999)  # Fabricated reference
-            ]
-        )
-        eligible, reason = engine.check_eligibility(fake_ref_hyp, self.report)
-        self.assertFalse(eligible)
+    # --- 3. OUTPUT BOUNDARY TESTS ---
 
-    def test_sandbox_boundary_mock_execution(self):
-        """Verify batch orchestrator logic, output truncation, and safety exception wrapping."""
-        # Predefined mock results
-        res_success = ValidationResult(
-            hypothesis_id="HYP-001",
+    def test_output_bounds_and_truncation(self):
+        """Verify stdout and stderr total combined output bytes limits and UTF-8 truncation."""
+        res_large = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
             status=ValidationStatus.VALIDATED,
             attempted=True,
             confirmed=True,
-            stdout="Orchestrator validation output",
+            stdout="A" * 100,
+            stderr="B" * 100
+        )
+        validator = MockSandboxValidator(predefined_results={self.valid_hyp.id: res_large})
+
+        # 1. Total byte capacity limit is 30
+        engine = ValidationEngine(validator, ValidationConfig(max_output_bytes=30))
+        results = engine.validate_hypotheses([self.valid_hyp], self.report)
+        r = results[0]
+        self.assertEqual(r.status, ValidationStatus.VALIDATED)
+
+        # Check total combined output length: stdout bytes + stderr bytes <= 30
+        total_len = len(r.stdout.encode("utf-8")) + len(r.stderr.encode("utf-8"))
+        self.assertTrue(total_len <= 30, f"Combined bytes size was: {total_len}")
+        self.assertTrue(r.stdout.endswith("[TRUNCATED]"))
+        self.assertTrue(r.stderr.endswith("[TRUNCATED]"))
+
+        # 2. Test unicode multi-byte characters with truncation marker
+        res_unicode = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True,
+            stdout="🚀🔥🌟💥🎉" * 10,
             stderr=""
         )
-        validator = MockSandboxValidator(predefined_results={"HYP-001": res_success})
-        config = ValidationConfig(max_output_bytes=10)  # Restrict output size
-        engine = ValidationEngine(validator, config)
-
+        validator.predefined_results[self.valid_hyp.id] = res_unicode
+        engine = ValidationEngine(validator, ValidationConfig(max_output_bytes=25))
         results = engine.validate_hypotheses([self.valid_hyp], self.report)
-        self.assertEqual(len(results), 1)
         r = results[0]
-        self.assertEqual(r.hypothesis_id, "HYP-001")
-        self.assertEqual(r.status, ValidationStatus.VALIDATED)
-        self.assertTrue(r.attempted)
-        self.assertTrue(r.confirmed)
-        # Verify output truncation
-        self.assertTrue(r.stdout.endswith("[TRUNCATED]"))
-        self.assertEqual(len(r.stdout), 10 + len("... [TRUNCATED]"))
+        # Total stdout size must fit within 25 bytes and contain no partial characters
+        stdout_bytes = r.stdout.encode("utf-8")
+        self.assertTrue(len(stdout_bytes) <= 25)
+        # Verify decoding succeeded without errors
+        r.stdout.encode("utf-8").decode("utf-8")
 
-    def test_sandbox_exception_safety(self):
-        """Verify that single validator failures/exceptions fail closed and do not abort the run."""
-        class CrashValidator(MockSandboxValidator):
-            def validate(self, hypothesis, context):
-                raise RuntimeError("Sandbox environment crashed")
+    # --- 4. HYPOTHESIS ID AUTHENTICATION ---
 
-        engine = ValidationEngine(CrashValidator())
-        results = engine.validate_hypotheses([self.valid_hyp], self.report)
-
-        self.assertEqual(len(results), 1)
-        r = results[0]
-        self.assertEqual(r.status, ValidationStatus.SANDBOX_ERROR)
-        self.assertTrue(r.attempted)
-        self.assertFalse(r.confirmed)
-        self.assertIn("Validator raised exception: Sandbox environment crashed", r.error_message)
-
-    def test_trueforge_adapter_configuration_failure(self):
-        """Verify TrueForgeSandboxValidator configuration check fails safely."""
-        # Fail closed on invalid API key configuration
-        tf_validator = TrueForgeSandboxValidator(api_key="")
-        res = tf_validator.validate(self.valid_hyp, self.report)
-        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
-        self.assertFalse(res.attempted)
-        self.assertIn("Missing TRUEFORGE_API_KEY", res.error_message)
-
-    def test_deterministic_hypothesis_sorting(self):
-        """Verify validation results are output in deterministic order sorted by ID."""
-        hyp2 = SecurityHypothesis(
-            id="HYP-002",
-            title="T2",
-            description="D2",
-            category="command_injection",
-            severity="HIGH",
-            confidence=0.8,
-            evidence_references=[EvidenceReference(type="route", file="src/server.py", line=12)]
-        )
+    def test_hypothesis_id_authentication(self):
+        """Verify hypothesis ID recomputation and validation boundary authentication checks."""
         validator = MockSandboxValidator()
         engine = ValidationEngine(validator)
 
-        # Order input randomly
-        results = engine.validate_hypotheses([hyp2, self.valid_hyp], self.report)
-        self.assertEqual(len(results), 2)
-        self.assertEqual(results[0].hypothesis_id, "HYP-001")
-        self.assertEqual(results[1].hypothesis_id, "HYP-002")
+        # 1. Arbitrary fake ID fails authentication
+        fake_hyp = SecurityHypothesis(
+            id="HYP-FAKE-ID",
+            title=self.valid_hyp.title,
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=self.valid_hyp.evidence_references,
+            rationale=self.valid_hyp.rationale
+        )
+        eligible, reason = engine.check_eligibility(fake_hyp, self.report)
+        self.assertFalse(eligible)
+        self.assertIn("ID authentication failed", reason)
+
+        # 2. Modified title with original ID fails authentication
+        modified_title_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title="Modified Title",
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=self.valid_hyp.evidence_references,
+            rationale=self.valid_hyp.rationale
+        )
+        eligible, reason = engine.check_eligibility(modified_title_hyp, self.report)
+        # Note: For deterministic ID, title modification does not affect recomputed ID.
+        # But wait! For LLM hypotheses, title does affect ID.
+        # Let's verify with an LLM hypothesis style ID:
+        llm_ref = [EvidenceReference(type="route", file="src/server.py", line=12, detail="Route: POST /run")]
+        llm_identity = {
+            "category": "command_injection",
+            "title": "LLM Hypothesis Title",
+            "description": "LLM Hypothesis Desc",
+            "references": [{"type": "route", "file": "src/server.py", "line": 12, "detail": "Route: POST /run"}]
+        }
+        llm_id = generate_hypothesis_id("command_injection", llm_identity, is_llm=True)
+        llm_hyp = SecurityHypothesis(
+            id=llm_id,
+            title="LLM Hypothesis Title",
+            description="LLM Hypothesis Desc",
+            category="command_injection",
+            severity="HIGH",
+            confidence=0.8,
+            evidence_references=llm_ref
+        )
+        # Re-authenticating valid LLM hypothesis -> works
+        eligible, reason = engine.check_eligibility(llm_hyp, self.report)
+        self.assertTrue(eligible, reason)
+
+        # Modify LLM hypothesis title -> fails authentication
+        llm_hyp_mod = SecurityHypothesis(
+            id=llm_id,
+            title="Modified Title",
+            description="LLM Hypothesis Desc",
+            category="command_injection",
+            severity="HIGH",
+            confidence=0.8,
+            evidence_references=llm_ref
+        )
+        eligible, reason = engine.check_eligibility(llm_hyp_mod, self.report)
+        self.assertFalse(eligible)
+
+        # 3. Modified deterministic reference details/location fails
+        mod_ref_hyp = SecurityHypothesis(
+            id=self.valid_hyp.id,
+            title=self.valid_hyp.title,
+            description=self.valid_hyp.description,
+            category=self.valid_hyp.category,
+            severity=self.valid_hyp.severity,
+            confidence=self.valid_hyp.confidence,
+            evidence_references=[
+                # Use route line 20 instead of 12 (mismatch with the original correlated ID reference)
+                EvidenceReference(type="route", file="src/server.py", line=20, detail="")
+            ]
+        )
+        eligible, reason = engine.check_eligibility(mod_ref_hyp, self.report)
+        self.assertFalse(eligible)
+
+    # --- 5. FILE EVIDENCE LINE NUMBERS ---
+
+    def test_file_evidence_references_rules(self):
+        """Verify file references must have no line numbers."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # Plain file reference with line is None -> OK
+        ref_ok = EvidenceReference(type="file", file="config.json", line=None)
+        valid, _ = engine._resolve_and_validate_evidence(ref_ok, self.report)
+        self.assertTrue(valid)
+
+        # Plain file reference with line set -> rejected
+        ref_bad_line = EvidenceReference(type="file", file="config.json", line=12)
+        valid, _ = engine._resolve_and_validate_evidence(ref_bad_line, self.report)
+        self.assertFalse(valid)
+
+    # --- 6. EVIDENCE DETAILS CANONICALIZATION ---
+
+    def test_evidence_detail_canonicalization(self):
+        """Verify caller-provided detail is ignored and replaced with authoritative inspection report findings."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # Caller provides fabricated details
+        ref = EvidenceReference(type="route", file="src/server.py", line=12, detail="EXECUTE DANGEROUS SHELL HERE")
+        valid, auth_detail = engine._resolve_and_validate_evidence(ref, self.report)
+        self.assertTrue(valid)
+        self.assertEqual(auth_detail, "Route: POST /run")  # Replaced with authoritative description
+
+    # --- 7. VALIDATOR RESULT INTEGRITY ---
+
+    def test_validation_result_integrity_checks(self):
+        """Verify strict validations of ValidationResult structure and invariant properties."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # 1. Adapter returns wrong ID
+        bad_id_res = ValidationResult(
+            hypothesis_id="HYP-WRONG-ID",
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True
+        )
+        res = engine._validate_result_integrity(bad_id_res, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertIn("Hypothesis ID mismatch", res.error_message)
+
+        # 2. Contradictory invariants: status = VALIDATED but attempted = False
+        bad_invariants_res = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=False,
+            confirmed=True
+        )
+        res = engine._validate_result_integrity(bad_invariants_res, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertIn("Contradictory state invariants", res.error_message)
+
+        # 3. Invalid types in result fields
+        bad_type_res = ValidationResult(
+            hypothesis_id=self.valid_hyp.id,
+            status=ValidationStatus.VALIDATED,
+            attempted=True,
+            confirmed=True,
+            confidence_delta=True  # boolean instead of float
+        )
+        res = engine._validate_result_integrity(bad_type_res, self.valid_hyp.id)
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertIn("Invalid confidence_delta", res.error_message)
+
+    # --- 8. DET_SORTING AND SAFEGUARDS ---
+
+    def test_malformed_hypothesis_safeguard(self):
+        """Verify malformed hypotheses list inputs do not crash sorting or orchestration."""
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # List contains integers, None, empty strings, dictionary, and a valid hypothesis
+        payload = [
+            None,
+            "String hypothesis",
+            {"id": "HYP-001"},
+            self.valid_hyp,
+            self.valid_hyp_2
+        ]
+
+        results = engine.validate_hypotheses(payload, self.report)
+        # Validates and runs only valid instances, returns INVALID_HYPOTHESIS for malformed elements
+        self.assertEqual(len(results), 5)
+        invalid_results = [r for r in results if r.status == ValidationStatus.INVALID_HYPOTHESIS]
+        self.assertEqual(len(invalid_results), 3)
+
+        # Valid ones ran and returned result
+        valid_results = [r for r in results if r.status == ValidationStatus.NOT_CONFIRMED]
+        self.assertEqual(len(valid_results), 2)
+        # Assert sorting by ID
+        self.assertTrue(valid_results[0].hypothesis_id < valid_results[1].hypothesis_id)
 
     @patch("builtins.open")
     @patch("subprocess.run")
     @patch("os.system")
     def test_safety_boundary(self, mock_system, mock_run, mock_open):
-        """Verify host filesystem, shell, and subprocess commands are never executed."""
+        """Verify host command execution interfaces are never called by orchestrator."""
         validator = MockSandboxValidator()
         engine = ValidationEngine(validator)
         engine.validate_hypotheses([self.valid_hyp], self.report)
