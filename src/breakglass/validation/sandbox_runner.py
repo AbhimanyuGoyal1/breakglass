@@ -87,9 +87,23 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
             file_path = ind.get("file", "")
 
             # Subprocess/sandbox check: verify the file exists on disk inside sandbox root
-            resolved_path = os.path.abspath(os.path.join(sandbox_root_abs, file_path))
+            try:
+                resolved_path = os.path.realpath(os.path.join(sandbox_root_abs, file_path))
+            except Exception as e:
+                return {
+                    "hypothesis_id": hyp_id,
+                    "status": "SANDBOX_ERROR",
+                    "attempted": True,
+                    "confirmed": False,
+                    "confidence_delta": 0.0,
+                    "evidence": "",
+                    "stdout": "",
+                    "stderr": "",
+                    "metadata": {},
+                    "error_message": f"Security violation: path resolution failed for '{file_path}': {str(e)}"
+                }
 
-            # Enforce sandbox boundary containment to reject path traversal escapes
+            # Enforce sandbox boundary containment to reject path traversal and symlink escapes
             if not (resolved_path.startswith(sandbox_root_abs + os.sep) or resolved_path == sandbox_root_abs):
                 return {
                     "hypothesis_id": hyp_id,
