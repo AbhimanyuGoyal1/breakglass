@@ -920,6 +920,74 @@ class TestValidationOrchestrator(unittest.TestCase):
             backend.execute("runner.py", ".", "{}", 10.0, 1024, cancellation_event)
             self.assertTrue(mock_proc.kill.called)
 
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_adversarial_malformed_evidence_references_types(self, m1, m2, m3):
+        """Verify various malformed evidence_references field shapes and types (string, integer, nested bad object) fail closed."""
+        orchestrator = ValidationOrchestrator(self.validator)
+        from breakglass.validation.engine import ValidationEngine
+        engine = ValidationEngine(self.validator)
+
+        bad_shapes = [
+            # 1. evidence_references as a string
+            SecurityHypothesis(id="HYP-BAD-REF-STR", title="T", description="D", category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references="not-a-list"),
+            # 2. evidence_references as an integer
+            SecurityHypothesis(id="HYP-BAD-REF-INT", title="T", description="D", category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references=12345),
+            # 3. missing hypothesis ID (empty string)
+            SecurityHypothesis(id="", title="T", description="D", category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references=[EvidenceReference(type="subprocess", file="a.py", line=1, detail="")]),
+            # 4. non-string ID
+            SecurityHypothesis(id=555, title="T", description="D", category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references=[EvidenceReference(type="subprocess", file="a.py", line=1, detail="")]),
+            # 5. invalid category type
+            SecurityHypothesis(id="HYP-BAD-CAT", title="T", description="D", category=999, severity="CRITICAL", confidence=0.8, evidence_references=[EvidenceReference(type="subprocess", file="a.py", line=1, detail="")]),
+            # 6. invalid title/description type
+            SecurityHypothesis(id="HYP-BAD-TITLE", title=123, description="D", category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references=[EvidenceReference(type="subprocess", file="a.py", line=1, detail="")]),
+            SecurityHypothesis(id="HYP-BAD-DESC", title="T", description=dict(), category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references=[EvidenceReference(type="subprocess", file="a.py", line=1, detail="")]),
+        ]
+
+        for bad_hyp in bad_shapes:
+            # A. Test Orchestrator direct call
+            report = orchestrator.validate_batch([bad_hyp], self.report)
+            self.assertEqual(len(report.results), 1)
+            self.assertEqual(report.results[0]["status"], "INVALID_HYPOTHESIS")
+            self.assertFalse(report.results[0]["attempted"])
+            self.assertFalse(report.results[0]["confirmed"])
+
+            # B. Test Engine direct call
+            engine_results = engine.validate_hypotheses([bad_hyp], self.report)
+            self.assertEqual(len(engine_results), 1)
+            self.assertEqual(engine_results[0].status, ValidationStatus.INVALID_HYPOTHESIS)
+            self.assertFalse(engine_results[0].attempted)
+            self.assertFalse(engine_results[0].confirmed)
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_multiple_malformed_followed_by_valid(self, m1, m2, m3):
+        """Verify that multiple malformed hypotheses do not prevent subsequent valid hypotheses from executing in both Orchestrator and Engine."""
+        hyp_bad_1 = SecurityHypothesis(id="HYP-BAD-M1", title="T", description="D", category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references=None)
+        hyp_bad_2 = SecurityHypothesis(id="HYP-BAD-M2", title="T", description="D", category="subprocess", severity="CRITICAL", confidence=0.8, evidence_references="not-list")
+        hyp_good = self.hypotheses[0]
+
+        # 1. Orchestrator
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch([hyp_bad_1, hyp_bad_2, hyp_good], self.report)
+        self.assertEqual(len(report.results), 3)
+        res_by_id = {r["hypothesis_id"]: r for r in report.results}
+        self.assertEqual(res_by_id["HYP-BAD-M1"]["status"], "INVALID_HYPOTHESIS")
+        self.assertEqual(res_by_id["HYP-BAD-M2"]["status"], "INVALID_HYPOTHESIS")
+        self.assertEqual(res_by_id[hyp_good.id]["status"], "VALIDATED")
+
+        # 2. Engine
+        from breakglass.validation.engine import ValidationEngine
+        engine = ValidationEngine(self.validator)
+        engine_results = engine.validate_hypotheses([hyp_bad_1, hyp_bad_2, hyp_good], self.report)
+        self.assertEqual(len(engine_results), 3)
+        res_by_id_eng = {r.hypothesis_id: r for r in engine_results}
+        self.assertEqual(res_by_id_eng["HYP-BAD-M1"].status, ValidationStatus.INVALID_HYPOTHESIS)
+        self.assertEqual(res_by_id_eng["HYP-BAD-M2"].status, ValidationStatus.INVALID_HYPOTHESIS)
+        self.assertEqual(res_by_id_eng[hyp_good.id].status, ValidationStatus.VALIDATED)
+
 
 if __name__ == "__main__":
     unittest.main()

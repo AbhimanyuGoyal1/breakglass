@@ -337,130 +337,25 @@ class ValidationOrchestrator:
 
             # Exception-isolated per-hypothesis preflight validation
             try:
-                # Complete shape & type checks on untrusted input object to prevent crash
-                if not isinstance(hyp, SecurityHypothesis):
+                is_valid, canonical_hyp, err_msg = engine.validate_hypothesis_shape(hyp, report)
+                if not is_valid:
                     err_res = ValidationResult(
-                        hypothesis_id="",
+                        hypothesis_id=getattr(hyp, "id", "") if (hasattr(hyp, "id") and isinstance(hyp.id, str)) else "",
                         status=ValidationStatus.INVALID_HYPOTHESIS,
                         attempted=False,
                         confirmed=False,
-                        error_message="Invalid hypothesis shape: Not a SecurityHypothesis instance"
+                        error_message=err_msg
                     )
                     results_list.append(err_res.to_dict())
                     continue
 
-                if not hasattr(hyp, "id") or not isinstance(hyp.id, str) or not hyp.id.strip():
-                    err_res = ValidationResult(
-                        hypothesis_id="",
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message="Invalid hypothesis shape: Empty or non-string ID"
-                    )
-                    results_list.append(err_res.to_dict())
+                if canonical_hyp.id in seen_hypotheses:
                     continue
-
-                if hyp.id in seen_hypotheses:
-                    continue
-                seen_hypotheses.add(hyp.id)
+                seen_hypotheses.add(canonical_hyp.id)
 
                 if len(jobs) >= self.config.max_total_validations:
                     # We have reached the maximum total validations target, ignore further jobs
                     break
-
-                if not hasattr(hyp, "evidence_references") or not isinstance(hyp.evidence_references, list) or not hyp.evidence_references:
-                    err_res = ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message="Validation job preflight failed: Hypothesis has no evidence references"
-                    )
-                    results_list.append(err_res.to_dict())
-                    continue
-
-                # Strict field shape checking
-                if not hasattr(hyp, "title") or not hasattr(hyp, "description") or not hasattr(hyp, "category") or \
-                   not isinstance(hyp.title, str) or not isinstance(hyp.description, str) or not isinstance(hyp.category, str):
-                    err_res = ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message="Invalid hypothesis shape: title, description, and category must be strings"
-                    )
-                    results_list.append(err_res.to_dict())
-                    continue
-
-                # 2. Strict ID/Fields/Evidence Authentication (Engine Alignment)
-                # Reconstruct evidence references dynamically to check for fabricated entries
-                canonical_references = []
-                has_invalid_ref = False
-                for ref in hyp.evidence_references:
-                    if not isinstance(ref, EvidenceReference):
-                        has_invalid_ref = True
-                        break
-                    valid, auth_detail = engine._resolve_and_validate_evidence(ref, report)
-                    if not valid:
-                        has_invalid_ref = True
-                        break
-                    canonical_references.append(
-                        EvidenceReference(
-                            type=ref.type,
-                            file=ref.file,
-                            line=ref.line,
-                            detail=auth_detail
-                        )
-                    )
-
-                if has_invalid_ref:
-                    err_res = ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message="Eligibility check failed: Evidence reference failed to resolve or is fabricated"
-                    )
-                    results_list.append(err_res.to_dict())
-                    continue
-
-                canonical_references.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
-
-                canonical_hyp = SecurityHypothesis(
-                    id=hyp.id,
-                    title=hyp.title,
-                    description=hyp.description,
-                    category=hyp.category,
-                    severity=getattr(hyp, "severity", "CRITICAL") or "CRITICAL",
-                    confidence=float(getattr(hyp, "confidence", 0.8) or 0.8),
-                    evidence_references=canonical_references,
-                    rationale=getattr(hyp, "rationale", "") or ""
-                )
-
-                # Authenticate ID
-                if not engine._authenticate_hypothesis_id(canonical_hyp, report):
-                    err_res = ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message="Hypothesis authentication failed: ID does not match identity"
-                    )
-                    results_list.append(err_res.to_dict())
-                    continue
-
-                # Check eligibility
-                eligible, reason = engine.check_eligibility(canonical_hyp, report)
-                if not eligible:
-                    err_res = ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message=f"Eligibility check failed: {reason}"
-                    )
-                    results_list.append(err_res.to_dict())
-                    continue
 
                 job_id = str(uuid.uuid4())
                 evidence_refs = [
