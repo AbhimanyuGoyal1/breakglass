@@ -564,8 +564,8 @@ class TrueForgeSandboxValidator(SandboxValidator):
         self,
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
-        local_sandbox: bool = False,
-        container_sandbox: bool = False,
+        local_sandbox: Optional[bool] = None,
+        container_sandbox: Optional[bool] = None,
         image_name: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         max_output_bytes: Optional[int] = None
@@ -573,8 +573,17 @@ class TrueForgeSandboxValidator(SandboxValidator):
         # Read from environment variables if not provided
         self.api_key = api_key or os.environ.get("TRUEFORGE_API_KEY")
         self.endpoint = endpoint or os.environ.get("TRUEFORGE_ENDPOINT", "https://api.trueforge.example.com")
-        self.local_sandbox = local_sandbox or (os.environ.get("TRUEFORGE_LOCAL_SANDBOX") == "true")
-        self.container_sandbox = container_sandbox or (os.environ.get("TRUEFORGE_CONTAINER_SANDBOX") == "true")
+
+        if local_sandbox is not None:
+            self.local_sandbox = local_sandbox
+        else:
+            self.local_sandbox = os.environ.get("TRUEFORGE_LOCAL_SANDBOX") == "true"
+
+        if container_sandbox is not None:
+            self.container_sandbox = container_sandbox
+        else:
+            self.container_sandbox = os.environ.get("TRUEFORGE_CONTAINER_SANDBOX") == "true"
+
         self.image_name = image_name or os.environ.get("TRUEFORGE_SANDBOX_IMAGE", "python:3.11-slim")
 
         # Read limits

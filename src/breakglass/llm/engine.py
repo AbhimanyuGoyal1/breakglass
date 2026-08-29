@@ -108,14 +108,14 @@ class LLMReasoningEngine:
             raw_response = self.client.generate(system_prompt, user_prompt)
         except Exception as e:
             return ReasoningReport(
-                hypotheses=[],
+                hypotheses=deterministic_report.hypotheses,
                 validation_status="failed",
                 errors=[f"LLM Client generation failed: {str(e)}"]
             )
 
         if not isinstance(raw_response, str):
             return ReasoningReport(
-                hypotheses=[],
+                hypotheses=deterministic_report.hypotheses,
                 validation_status="failed",
                 errors=[f"LLM Client returned invalid response type: {type(raw_response).__name__}"]
             )
@@ -126,14 +126,14 @@ class LLMReasoningEngine:
             data = json.loads(cleaned_text)
         except Exception as e:
             return ReasoningReport(
-                hypotheses=[],
+                hypotheses=deterministic_report.hypotheses,
                 validation_status="failed",
                 errors=[f"Failed to parse LLM response as JSON: {str(e)}"]
             )
 
         if not isinstance(data, dict) or "hypotheses" not in data:
             return ReasoningReport(
-                hypotheses=[],
+                hypotheses=deterministic_report.hypotheses,
                 validation_status="failed",
                 errors=["JSON root must contain a 'hypotheses' key"]
             )
@@ -141,13 +141,14 @@ class LLMReasoningEngine:
         raw_hypotheses = data["hypotheses"]
         if not isinstance(raw_hypotheses, list):
             return ReasoningReport(
-                hypotheses=[],
+                hypotheses=deterministic_report.hypotheses,
                 validation_status="failed",
                 errors=["The 'hypotheses' key must point to a JSON list"]
             )
 
         valid_files = self._collect_all_valid_files(inspection_report)
-        validated_hypotheses_dict = {}
+        # Prepopulate with deterministic hypotheses to preserve them as baseline and avoid duplicates
+        validated_hypotheses_dict = {h.id: h for h in deterministic_report.hypotheses}
         errors = []
 
         supported_categories = {
@@ -292,8 +293,9 @@ class LLMReasoningEngine:
                 category, str(item["title"]), str(item["description"]), parsed_references
             )
 
-            # De-duplicate by ID
-            if stable_id in validated_hypotheses_dict:
+            # De-duplicate by ID (preserves deterministic if LLM generated it)
+            stable_id_det = stable_id.replace("HYP-LLM-", "HYP-", 1)
+            if stable_id in validated_hypotheses_dict or stable_id_det in validated_hypotheses_dict:
                 continue
 
             validated_hypotheses_dict[stable_id] = SecurityHypothesis(

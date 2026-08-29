@@ -69,6 +69,10 @@ def main():
         action="store_true",
         help="Enable verbose logging."
     )
+    parser.add_argument(
+        "--gemini-model",
+        help="Specify Gemini model to use for LLM reasoning (overrides GEMINI_MODEL env var)."
+    )
 
     args = parser.parse_args()
 
@@ -110,7 +114,7 @@ def main():
             if args.verbose:
                 print("[*] Extending hypotheses using LLM-assisted reasoning...")
             try:
-                client = GeminiLLMClient()
+                client = GeminiLLMClient(model_name=args.gemini_model)
                 llm_engine = LLMReasoningEngine(client)
                 reasoning_report = llm_engine.analyze(report, reasoning_report)
                 if reasoning_report.validation_status == "failed":
@@ -141,12 +145,12 @@ def main():
             if args.validator == "mock":
                 validator = MockSandboxValidator()
             elif args.validator == "local":
-                validator = TrueForgeSandboxValidator(local_sandbox=True)
+                validator = TrueForgeSandboxValidator(local_sandbox=True, container_sandbox=False, timeout_seconds=args.timeout)
             elif args.validator == "container":
-                validator = TrueForgeSandboxValidator(container_sandbox=True)
+                validator = TrueForgeSandboxValidator(container_sandbox=True, local_sandbox=False, timeout_seconds=args.timeout)
             elif args.validator == "trueforge":
                 # API orchestration mode
-                validator = TrueForgeSandboxValidator()
+                validator = TrueForgeSandboxValidator(local_sandbox=False, container_sandbox=False, timeout_seconds=args.timeout)
                 if not validator.api_key:
                     print("Error: TRUEFORGE_API_KEY environment variable is required for API validation mode.", file=sys.stderr)
                     sys.exit(1)
@@ -182,12 +186,8 @@ def main():
         # 5. Output Serialization
         if args.output:
             output_data = {
-                "repository": {
-                    "root": report.repository.root,
-                    "total_files": report.repository.total_files,
-                    "languages": report.repository.languages,
-                    "frameworks": report.repository.frameworks
-                },
+                "report": report.to_dict(),
+                "repository": report.repository.to_dict(),
                 "inspection_summary": {
                     "security_indicators": len(report.security_indicators),
                     "routes": len(report.routes),
@@ -197,6 +197,7 @@ def main():
                 "validation_results": [res.to_dict() for res in validation_results],
                 "metadata": {
                     "llm_enabled": args.llm,
+                    "gemini_model": args.gemini_model if args.llm else None,
                     "validation_enabled": args.validate,
                     "validator_type": args.validator if args.validate else None
                 }
