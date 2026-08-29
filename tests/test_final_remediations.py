@@ -178,6 +178,30 @@ class TestReasoningLLMAugmentation(unittest.TestCase):
         self.assertEqual(len(result.hypotheses), 1)
         self.assertEqual(result.hypotheses[0].id, self.det_id)
 
+    def test_empty_llm_output_preserves_deterministic_hypotheses(self):
+        """Verify deterministic hypotheses survive when the LLM returns an empty hypotheses list."""
+        llm_response = {"hypotheses": []}
+        client = MockLLMClient(response_text=json.dumps(llm_response))
+        engine = LLMReasoningEngine(client)
+        result = engine.analyze(self.report, self.det_report)
+
+        self.assertEqual(result.validation_status, "success")
+        self.assertEqual(len(result.hypotheses), 1)
+        self.assertEqual(result.hypotheses[0].id, self.det_id)
+
+    def test_deterministic_hypothesis_evidence_remains_authoritative(self):
+        """Verify that deterministic hypothesis evidence references remain authoritative after LLM analysis."""
+        llm_response = {"hypotheses": []}
+        client = MockLLMClient(response_text=json.dumps(llm_response))
+        engine = LLMReasoningEngine(client)
+        result = engine.analyze(self.report, self.det_report)
+
+        self.assertEqual(len(result.hypotheses), 1)
+        hyp = result.hypotheses[0]
+        self.assertEqual(len(hyp.evidence_references), 2)
+        self.assertEqual(hyp.evidence_references[0].detail, "Route: GET /run")
+        self.assertEqual(hyp.evidence_references[1].detail, "Security indicator: subprocess.run")
+
 
 class TestValidatorEnvironmentOverrides(unittest.TestCase):
     """Test suite verifying validator arguments override environment variables."""
@@ -207,6 +231,116 @@ class TestValidatorEnvironmentOverrides(unittest.TestCase):
             self.assertFalse(validator.container_sandbox)
 
 
+class TestCliValidatorSelectionOverrides(unittest.TestCase):
+    """Test suite proving CLI selection wins over ambient environment settings."""
+
+    @patch('breakglass.cli.TrueForgeSandboxValidator')
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    def test_cli_local_overrides_env(self, mock_det, mock_inspect, mock_validator_class):
+        """CLI local + container/local env enabled -> local"""
+        env_patches = {
+            "TRUEFORGE_LOCAL_SANDBOX": "true",
+            "TRUEFORGE_CONTAINER_SANDBOX": "true",
+        }
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+        with patch.dict(os.environ, env_patches):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'local']):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            mock_validator_class.assert_called_with(local_sandbox=True, container_sandbox=False, timeout_seconds=30.0)
+
+    @patch('breakglass.cli.TrueForgeSandboxValidator')
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    def test_cli_container_overrides_env(self, mock_det, mock_inspect, mock_validator_class):
+        """CLI container + local env enabled -> container"""
+        env_patches = {
+            "TRUEFORGE_LOCAL_SANDBOX": "true",
+            "TRUEFORGE_CONTAINER_SANDBOX": "false",
+        }
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+        with patch.dict(os.environ, env_patches):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'container']):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            mock_validator_class.assert_called_with(container_sandbox=True, local_sandbox=False, timeout_seconds=30.0)
+
+    @patch('breakglass.cli.TrueForgeSandboxValidator')
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    def test_cli_trueforge_overrides_env(self, mock_det, mock_inspect, mock_validator_class):
+        """CLI trueforge + both env flags enabled -> TrueForge API orchestration"""
+        env_patches = {
+            "TRUEFORGE_LOCAL_SANDBOX": "true",
+            "TRUEFORGE_CONTAINER_SANDBOX": "true",
+            "TRUEFORGE_API_KEY": "test_api_key"
+        }
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+        with patch.dict(os.environ, env_patches):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'trueforge']):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            mock_validator_class.assert_called_with(local_sandbox=False, container_sandbox=False, timeout_seconds=30.0)
+
+
+class TestCliTimeoutPropagation(unittest.TestCase):
+    """Test suite verifying CLI timeout propagation to TrueForgeSandboxValidator"""
+
+    @patch('breakglass.cli.TrueForgeSandboxValidator')
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    def test_cli_timeout_propagation_local(self, mock_det, mock_inspect, mock_validator_class):
+        """CLI local + timeout specified -> propagates to TrueForgeSandboxValidator"""
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+        with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'local', '--timeout', '120.0']):
+            try:
+                main()
+            except SystemExit:
+                pass
+        mock_validator_class.assert_called_with(local_sandbox=True, container_sandbox=False, timeout_seconds=120.0)
+
+    @patch('breakglass.cli.TrueForgeSandboxValidator')
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    def test_cli_timeout_propagation_container(self, mock_det, mock_inspect, mock_validator_class):
+        """CLI container + timeout specified -> propagates to TrueForgeSandboxValidator"""
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+        with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'container', '--timeout', '120.0']):
+            try:
+                main()
+            except SystemExit:
+                pass
+        mock_validator_class.assert_called_with(container_sandbox=True, local_sandbox=False, timeout_seconds=120.0)
+
+    @patch('breakglass.cli.TrueForgeSandboxValidator')
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    def test_cli_timeout_propagation_trueforge(self, mock_det, mock_inspect, mock_validator_class):
+        """CLI trueforge + timeout specified -> propagates to TrueForgeSandboxValidator"""
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+        env_patches = {"TRUEFORGE_API_KEY": "test_key"}
+        with patch.dict(os.environ, env_patches):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'trueforge', '--timeout', '120.0']):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+        mock_validator_class.assert_called_with(local_sandbox=False, container_sandbox=False, timeout_seconds=120.0)
+
+
 class TestGeminiModelConfiguration(unittest.TestCase):
     """Test suite verifying Gemini model configuration and fallback updates."""
 
@@ -226,6 +360,33 @@ class TestGeminiModelConfiguration(unittest.TestCase):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test_key", "GEMINI_MODEL": "gemini-2.0-flash-exp"}, clear=True):
             client = GeminiLLMClient(model_name="gemini-1.5-pro-latest")
             self.assertEqual(client.model_name, "gemini-1.5-pro-latest")
+
+    @patch('breakglass.cli.GeminiLLMClient')
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    @patch('breakglass.cli.LLMReasoningEngine')
+    def test_cli_gemini_model_propagation(self, mock_llm_engine, mock_det, mock_inspect, mock_client_class):
+        """CLI model option propagates to GeminiLLMClient constructor"""
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+
+        # Test case 1: Explicit --gemini-model overrides
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test_key"}, clear=True):
+            with patch('sys.argv', ['breakglass', '.', '--llm', '--gemini-model', 'gemini-2.5-pro']):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            mock_client_class.assert_called_with(model_name='gemini-2.5-pro')
+
+        # Test case 2: Default when not specified falls back to None in constructor (delegating to client class default/env)
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test_key"}, clear=True):
+            with patch('sys.argv', ['breakglass', '.', '--llm']):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+            mock_client_class.assert_called_with(model_name=None)
 
 
 class TestTimeoutPropagation(unittest.TestCase):
