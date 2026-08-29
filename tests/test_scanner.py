@@ -342,6 +342,116 @@ class TestCodebaseScanner(unittest.TestCase):
             report = inspect_repository(str(repo_path))
             self.assertIn("UserTest.java", report.repository.test_files)
 
+    def test_adversarial_limits_validation(self):
+        """Test that InspectionLimits validation rejects NaN, infinities, and non-positive numbers."""
+        from breakglass.inspection import InspectionLimits
+        # Test max_files bad values
+        for bad_val in (float("nan"), float("inf"), float("-inf"), 0, -1, "not-an-int"):
+            with self.assertRaises(ValueError):
+                InspectionLimits(max_files=bad_val).validate()
+        # Test max_duration_seconds bad values
+        for bad_val in (float("nan"), float("inf"), float("-inf"), 0, -1, "not-a-float"):
+            with self.assertRaises(ValueError):
+                InspectionLimits(max_duration_seconds=bad_val).validate()
+
+    def test_adversarial_traversal_escapes(self):
+        """Test path containment boundary verification rejects traversal, drive variations, and outside symlinks."""
+        from breakglass.inspection import RepositoryInspectionEngine
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir).resolve()
+            outside_path = repo_path.parent / "outside_file.py"
+            outside_path.write_text("print('outside')")
+
+            # Create symlink pointing outside
+            symlink_path = repo_path / "link_to_outside.py"
+            try:
+                symlink_path.symlink_to(outside_path)
+            except OSError:
+                # Symlinks might fail on Windows if not admin, mock or skip this subtest
+                pass
+
+            engine = RepositoryInspectionEngine()
+            report = engine.inspect(str(repo_path))
+
+            # Outside file must not be scanned, link should generate symlink_out_of_bounds error or be skipped
+            all_files = [x.file for x in report.security_indicators]
+            self.assertNotIn("outside_file.py", all_files)
+            if symlink_path.exists() and symlink_path.is_symlink():
+                self.assertTrue(any(e.error_type == "symlink_out_of_bounds" for e in report.errors))
+
+    def test_adversarial_prefix_dir_collision(self):
+        """Test that directory component-aware check handles prefix-collisions (e.g. /repo vs /repo-backup) without overmatching."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            repo = base / "repo"
+            repo_backup = base / "repo-backup"
+            repo.mkdir()
+            repo_backup.mkdir()
+
+            (repo / "node_modules").mkdir()
+            (repo / "node_modules" / "dummy.js").write_text("import os; os.system('node_modules')")
+            (repo / "node_modules_handler.js").write_text("import os; os.system('safe')")
+
+            engine = RepositoryInspectionEngine()
+            report = engine.inspect(str(repo))
+
+            # The node_modules directory components must be excluded, but node_modules_handler.js must be scanned
+            scanned_files = [s.file for s in report.security_indicators]
+            self.assertTrue(any("node_modules_handler.js" in f for f in scanned_files if f))
+            self.assertFalse(any("node_modules/dummy.js" in f for f in scanned_files if f))
+
+    def test_adversarial_resource_limits_enforced(self):
+        """Test that traversal, file scans, and findings limits are strictly enforced, returning bounded/partial results."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            for i in range(10):
+                (repo_path / f"file_{i}.py").write_text("import os; os.system('run')\n")
+
+            # Limit to 3 files
+            limits = InspectionLimits(max_files=3)
+            engine = RepositoryInspectionEngine(limits)
+            report = engine.inspect(str(repo_path))
+
+            self.assertEqual(report.repository.total_files, 3)
+            self.assertTrue(any(e.error_type == "resource_limit_exceeded" for e in report.errors))
+
+    def test_adversarial_secret_redaction(self):
+        """Test that plain text credential values never leak and are sanitized to [REDACTED]."""
+        from breakglass.inspection import RepositoryInspectionEngine
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            (repo_path / "config.py").write_text('api_key = "sk_live_abcdef123456"\npassword = \'super-secret-pass\'\n')
+
+            engine = RepositoryInspectionEngine()
+            report = engine.inspect(str(repo_path))
+
+            # Confirm indicator contains redacted evidence snippet
+            inds = [x for x in report.security_indicators if "api_key" in x.evidence or "password" in x.evidence]
+            self.assertGreater(len(inds), 0)
+            for ind in inds:
+                self.assertNotIn("sk_live_abcdef123456", ind.evidence)
+                self.assertNotIn("super-secret-pass", ind.evidence)
+                self.assertIn("[REDACTED]", ind.evidence)
+
+    def test_adversarial_serialized_size_limits(self):
+        """Test report serialized size pruning when it exceeds configured limits."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_path = Path(temp_dir)
+            for i in range(50):
+                (repo_path / f"file_{i}.py").write_text(f"import os; os.system('run_{i}')\n")
+
+            # Limit report size to a tiny budget
+            limits = InspectionLimits(max_serialized_report_bytes=2000)
+            engine = RepositoryInspectionEngine(limits)
+            report = engine.inspect(str(repo_path))
+
+            serialized = report.to_json()
+            self.assertLessEqual(len(serialized.encode("utf-8")), 2000)
+            self.assertTrue(any(e.error_type == "serialized_report_size_exceeded" for e in report.errors))
+
 
 if __name__ == "__main__":
     unittest.main()

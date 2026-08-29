@@ -136,6 +136,30 @@ ROUTE_PATTERNS: List[Tuple[re.Pattern, str]] = [
 ]
 
 
+def redact_secrets(text: str) -> str:
+    """Redacts plain text secret values (like api_key="sk_live_...") from text strings to prevent leakage."""
+    if not text:
+        return text
+    # Regex to find secrets/passwords/keys in assignments: e.g. api_key = "..." or password: '...'
+    # Matches typical keys: password, secret, token, key, api_key, etc.
+    # Group 1: key name, Group 2: separator, Group 3: quote character, Group 4: value, Group 5: quote character
+    pattern = r"""(?i)\b(password|pass|secret|token|key|api_?key|auth|jwt|private_?key)\b\s*([:=])\s*(['"])([^'"]+)(['"])"""
+
+    def replacer(match):
+        key = match.group(1)
+        sep = match.group(2)
+        quote = match.group(3)
+        return f"{key}{sep}{quote}[REDACTED]{quote}"
+
+    sanitized = re.sub(pattern, replacer, text)
+
+    # Also detect private key blocks
+    if "BEGIN PRIVATE KEY" in sanitized or "BEGIN RSA PRIVATE KEY" in sanitized or "BEGIN OPENSSH PRIVATE KEY" in sanitized:
+        return "[REDACTED PRIVATE KEY BLOCK]"
+
+    return sanitized
+
+
 def scan_line_for_indicators(
     line: str,
     line_num: int,
@@ -166,7 +190,7 @@ def scan_line_for_indicators(
                     indicator_type=rule.indicator_type,
                     file=file_rel_path,
                     line=line_num,
-                    evidence=snippet,
+                    evidence=redact_secrets(snippet),
                     confidence=rule.confidence
                 )
             )
@@ -218,7 +242,7 @@ def scan_line_for_routes(
                     line=line_num,
                     method=method,
                     pattern=pattern,
-                    evidence=line.strip()[:100],
+                    evidence=redact_secrets(line.strip()[:100]),
                     confidence=0.85
                 )
             )
