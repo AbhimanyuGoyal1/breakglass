@@ -62,6 +62,24 @@ class MockSandboxValidator(SandboxValidator):
         )
 
 
+class _CombinedOutputCounter:
+    """Thread-safe counter to track combined stdout and stderr bytes."""
+    def __init__(self, limit: int):
+        self._lock = threading.Lock()
+        self._value = 0
+        self._limit = limit
+
+    def add(self, amount: int) -> bool:
+        with self._lock:
+            self._value += amount
+            return self._value >= self._limit
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
 class TrueForgeSandboxValidator(SandboxValidator):
     """Adapter boundary for the TrueForge execution sandbox."""
 
@@ -97,14 +115,46 @@ class TrueForgeSandboxValidator(SandboxValidator):
         else:
             return str(obj)
 
-    def _reader_thread(self, stream: Any, q: queue.Queue) -> None:
+    def _reader_thread(
+        self,
+        stream: Any,
+        q: queue.Queue,
+        counter: _CombinedOutputCounter,
+        proc: subprocess.Popen,
+        overflow_event: threading.Event,
+        shutdown_event: threading.Event
+    ) -> None:
         """Reads chunks of output from a stream pipe and pushes them to a queue."""
         try:
-            while True:
+            while not shutdown_event.is_set():
                 chunk = stream.read(1024)
                 if not chunk or "Mock" in type(chunk).__name__:
                     break
-                q.put(chunk)
+
+                # Safe byte count computation
+                chunk_len = len(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+
+                # Check and add to counter
+                if counter.add(chunk_len):
+                    overflow_event.set()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    break
+
+                # Enqueue with timeout to prevent deadlocks
+                enqueued = False
+                while not shutdown_event.is_set():
+                    try:
+                        q.put(chunk, timeout=0.05)
+                        enqueued = True
+                        break
+                    except queue.Full:
+                        continue
+
+                if not enqueued:
+                    break
         except Exception:
             pass
 
@@ -157,10 +207,24 @@ class TrueForgeSandboxValidator(SandboxValidator):
             )
 
         # 3. Use thread readers and non-blocking writer to actively enforce combined limits
-        q_out = queue.Queue()
-        q_err = queue.Queue()
-        t_out = threading.Thread(target=self._reader_thread, args=(proc.stdout, q_out), daemon=True)
-        t_err = threading.Thread(target=self._reader_thread, args=(proc.stderr, q_err), daemon=True)
+        max_q_size = max(5, self.max_output_bytes // 1024 + 2)
+        q_out = queue.Queue(maxsize=max_q_size)
+        q_err = queue.Queue(maxsize=max_q_size)
+
+        counter = _CombinedOutputCounter(self.max_output_bytes)
+        overflow_event = threading.Event()
+        shutdown_event = threading.Event()
+
+        t_out = threading.Thread(
+            target=self._reader_thread,
+            args=(proc.stdout, q_out, counter, proc, overflow_event, shutdown_event),
+            daemon=True
+        )
+        t_err = threading.Thread(
+            target=self._reader_thread,
+            args=(proc.stderr, q_err, counter, proc, overflow_event, shutdown_event),
+            daemon=True
+        )
         t_out.start()
         t_err.start()
 
@@ -170,8 +234,6 @@ class TrueForgeSandboxValidator(SandboxValidator):
 
         stdout_chunks = []
         stderr_chunks = []
-        stdout_len = 0
-        stderr_len = 0
 
         timeout_hit = False
         overflow_hit = False
@@ -179,17 +241,21 @@ class TrueForgeSandboxValidator(SandboxValidator):
         while True:
             # Drain stdout
             while not q_out.empty():
-                chunk = q_out.get_nowait()
-                stdout_chunks.append(chunk)
-                stdout_len += len(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+                try:
+                    chunk = q_out.get_nowait()
+                    stdout_chunks.append(chunk)
+                except queue.Empty:
+                    break
 
             # Drain stderr
             while not q_err.empty():
-                chunk = q_err.get_nowait()
-                stderr_chunks.append(chunk)
-                stderr_len += len(chunk.encode("utf-8") if isinstance(chunk, str) else chunk)
+                try:
+                    chunk = q_err.get_nowait()
+                    stderr_chunks.append(chunk)
+                except queue.Empty:
+                    break
 
-            if stdout_len + stderr_len > self.max_output_bytes:
+            if overflow_event.is_set():
                 overflow_hit = True
                 break
 
@@ -207,7 +273,12 @@ class TrueForgeSandboxValidator(SandboxValidator):
 
         # Clean up subprocess securely (fail closed)
         if overflow_hit or timeout_hit:
-            proc.kill()
+            shutdown_event.set()
+            if not overflow_hit:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
             proc.wait()
             try:
                 proc.stdout.close()
@@ -234,10 +305,20 @@ class TrueForgeSandboxValidator(SandboxValidator):
 
         # Wait for the process to exit completely and drain the queues
         proc.wait()
+        t_out.join(timeout=1.0)
+        t_err.join(timeout=1.0)
+        shutdown_event.set()
+
         while not q_out.empty():
-            stdout_chunks.append(q_out.get_nowait())
+            try:
+                stdout_chunks.append(q_out.get_nowait())
+            except queue.Empty:
+                break
         while not q_err.empty():
-            stderr_chunks.append(q_err.get_nowait())
+            try:
+                stderr_chunks.append(q_err.get_nowait())
+            except queue.Empty:
+                break
 
         stdout_data = "".join(stdout_chunks)
         stderr_data = "".join(stderr_chunks)

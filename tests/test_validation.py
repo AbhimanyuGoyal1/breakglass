@@ -1050,5 +1050,64 @@ class TestSandboxValidation(unittest.TestCase):
             self.assertTrue(results.attempted)
             self.assertIn(expected_err, results.error_message)
 
+    @patch("subprocess.Popen")
+    def test_trueforge_validator_output_overflow_stdout_and_stderr(self, mock_popen):
+        """Verify that combined stdout and stderr bytes count towards the limit."""
+        mock_proc = MagicMock()
+        mock_proc.stdout.read.side_effect = ["A" * 50, ""]
+        mock_proc.stderr.read.side_effect = ["B" * 60, ""]
+        mock_proc.poll.return_value = None
+        mock_popen.return_value = mock_proc
+
+        validator = TrueForgeSandboxValidator(local_sandbox=True, max_output_bytes=100)
+        results = validator.validate(self.valid_hyp, self.report)
+
+        mock_proc.kill.assert_called()
+        self.assertEqual(results.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertIn("combined output size exceeded limit", results.error_message)
+
+    def test_reader_thread_bounded_queue_shutdown(self):
+        """Verify reader thread does not deadlock when queue is full and shutdown is signaled."""
+        import queue
+        import threading
+        from breakglass.validation.validator import _CombinedOutputCounter
+
+        validator = TrueForgeSandboxValidator(local_sandbox=True, max_output_bytes=100)
+
+        # Setup a small queue with maxsize=1
+        q = queue.Queue(maxsize=1)
+
+        # Mock stream that produces chunks indefinitely
+        class InfiniteStream:
+            def read(self, n):
+                return "A" * 10
+
+        stream = InfiniteStream()
+        counter = _CombinedOutputCounter(1000) # large limit so it doesn't trigger overflow
+        mock_proc = MagicMock()
+        overflow_event = threading.Event()
+        shutdown_event = threading.Event()
+
+        # Start reader thread
+        t = threading.Thread(
+            target=validator._reader_thread,
+            args=(stream, q, counter, mock_proc, overflow_event, shutdown_event),
+            daemon=True
+        )
+        t.start()
+
+        # Wait for the queue to fill up (it has maxsize=1, so it fills quickly)
+        # The reader thread should be blocked trying to enqueue the second chunk.
+        time.sleep(0.1)
+        self.assertTrue(t.is_alive())
+        self.assertEqual(q.qsize(), 1)
+
+        # Signal shutdown
+        shutdown_event.set()
+
+        # The reader thread should wake up from blocking and exit cleanly
+        t.join(timeout=1.0)
+        self.assertFalse(t.is_alive())
+
 if __name__ == "__main__":
     unittest.main()
