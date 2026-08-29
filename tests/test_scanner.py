@@ -418,22 +418,37 @@ class TestCodebaseScanner(unittest.TestCase):
             self.assertTrue(any(e.error_type == "resource_limit_exceeded" for e in report.errors))
 
     def test_adversarial_secret_redaction(self):
-        """Test that plain text credential values never leak and are sanitized to [REDACTED]."""
-        from breakglass.inspection import RepositoryInspectionEngine
-        with tempfile.TemporaryDirectory() as temp_dir:
-            repo_path = Path(temp_dir)
-            (repo_path / "config.py").write_text('api_key = "sk_live_abcdef123456"\npassword = \'super-secret-pass\'\n')
+        """Test that plain text credential values (quoted/unquoted, multiple, delimited) are redacted cleanly."""
+        from breakglass.inspection.indicators import redact_secrets
 
-            engine = RepositoryInspectionEngine()
-            report = engine.inspect(str(repo_path))
+        secrets_to_test = [
+            ("API_KEY=sk_live_123456", "API_KEY=[REDACTED]", "sk_live_123456"),
+            ("API_KEY=\"sk_live_123456\"", "API_KEY=\"[REDACTED]\"", "sk_live_123456"),
+            ("API_KEY='sk_live_123456'", "API_KEY='[REDACTED]'", "sk_live_123456"),
+            ("DB_PASSWORD: hunter2", "DB_PASSWORD: [REDACTED]", "hunter2"),
+            ("TOKEN: abc123", "TOKEN: [REDACTED]", "abc123"),
+            ("password = secret123", "password = [REDACTED]", "secret123"),
+            ("API_KEY=foo, TOKEN=bar", "API_KEY=[REDACTED], TOKEN=[REDACTED]", "foo"),
+            ("API_KEY=foo TOKEN=bar", "API_KEY=[REDACTED] TOKEN=[REDACTED]", "bar"),
+            ("API_KEY=foo; TOKEN=bar", "API_KEY=[REDACTED]; TOKEN=[REDACTED]", "foo"),
+            ("password = secret123 # unrelated comment", "password = [REDACTED] # unrelated comment", "secret123"),
+            ("BEGIN PRIVATE KEY\n...\nEND PRIVATE KEY", "[REDACTED PRIVATE KEY BLOCK]", "BEGIN PRIVATE KEY"),
+        ]
 
-            # Confirm indicator contains redacted evidence snippet
-            inds = [x for x in report.security_indicators if "api_key" in x.evidence or "password" in x.evidence]
-            self.assertGreater(len(inds), 0)
-            for ind in inds:
-                self.assertNotIn("sk_live_abcdef123456", ind.evidence)
-                self.assertNotIn("super-secret-pass", ind.evidence)
-                self.assertIn("[REDACTED]", ind.evidence)
+        for original, expected, secret_val in secrets_to_test:
+            redacted = redact_secrets(original)
+            self.assertEqual(redacted, expected)
+            if secret_val and secret_val not in ("[REDACTED]", "[REDACTED PRIVATE KEY BLOCK]"):
+                self.assertNotIn(secret_val, redacted)
+
+        # Test false positives (should remain unchanged)
+        false_positives = [
+            "keyboard = 123",
+            "auth_method = 123",
+            "passphrase_check = True",
+        ]
+        for fp in false_positives:
+            self.assertEqual(redact_secrets(fp), fp)
 
     def test_adversarial_serialized_size_limits(self):
         """Test report serialized size pruning when it exceeds configured limits."""

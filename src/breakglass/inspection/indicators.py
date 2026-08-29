@@ -140,16 +140,22 @@ def redact_secrets(text: str) -> str:
     """Redacts plain text secret values (like api_key="sk_live_...") from text strings to prevent leakage."""
     if not text:
         return text
-    # Regex to find secrets/passwords/keys in assignments: e.g. api_key = "..." or password: '...'
-    # Matches typical keys: password, secret, token, key, api_key, etc.
-    # Group 1: key name, Group 2: separator, Group 3: quote character, Group 4: value, Group 5: quote character
-    pattern = r"""(?i)\b(password|pass|secret|token|key|api_?key|auth|jwt|private_?key)\b\s*([:=])\s*(['"])([^'"]+)(['"])"""
+    # Regex to find secrets/passwords/keys in assignments: e.g. api_key = "..." or password: hunter2
+    # Group 1: key name (allowing prefixes like API_ or DB_)
+    # Group 2: separator with surrounding spaces
+    # Group 3: quote character (if any)
+    # Group 4: quoted value
+    # Group 5: unquoted value (terminated by whitespace, comma, semicolon, or end of line)
+    pattern = r"""(?i)\b([a-z0-9_-]*(?:password|pass|secret|token|key|api_?key|auth|jwt|private_?key))\b(\s*[:=]\s*)(?:(['"])([^'"\r\n]+)\3|([^'"\s,;]+))"""
 
     def replacer(match):
         key = match.group(1)
-        sep = match.group(2)
+        sep_with_spaces = match.group(2)
         quote = match.group(3)
-        return f"{key}{sep}{quote}[REDACTED]{quote}"
+        if quote:
+            return f"{key}{sep_with_spaces}{quote}[REDACTED]{quote}"
+        else:
+            return f"{key}{sep_with_spaces}[REDACTED]"
 
     sanitized = re.sub(pattern, replacer, text)
 

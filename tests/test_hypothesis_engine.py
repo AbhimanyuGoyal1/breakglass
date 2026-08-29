@@ -438,7 +438,7 @@ class TestSecurityHypothesisEngine(unittest.TestCase):
             ),
             routes=[RouteCandidate(file="src/server.py", line=12, method="POST", pattern="/run", evidence="")],
             security_indicators=[
-                SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=123"),
+                SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=[REDACTED]"),
                 SecurityIndicator(category="subprocess", indicator_type="subprocess_indicator", file="src/server.py", line=15, evidence="subprocess.run"),
                 SecurityIndicator(category="authentication", indicator_type="auth_check", file="src/server.py", line=25, evidence="login()"),
                 SecurityIndicator(category="filesystem", indicator_type="file_access", file="src/server.py", line=35, evidence="open()")
@@ -472,7 +472,7 @@ class TestSecurityHypothesisEngine(unittest.TestCase):
                 config_files=[], docker_configs=[], cicd_configs=[], infrastructure_configs=[], test_files=[]
             ),
             routes=[],
-            security_indicators=[SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=123")],
+            security_indicators=[SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=[REDACTED]")],
             entry_points=[], manifests=[], errors=[]
         )
         generator = SecurityHypothesisGenerator()
@@ -507,7 +507,7 @@ class TestSecurityHypothesisEngine(unittest.TestCase):
                 config_files=[], docker_configs=[], cicd_configs=[], infrastructure_configs=[], test_files=[]
             ),
             routes=[],
-            security_indicators=[SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=123")],
+            security_indicators=[SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=[REDACTED]")],
             entry_points=[], manifests=[], errors=[]
         )
         res_corr = generator.generate_and_rank(report_corr, self.repo_root)
