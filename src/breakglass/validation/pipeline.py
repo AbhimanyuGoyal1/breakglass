@@ -226,25 +226,40 @@ def verify_result_provenance(
     tracker: JobLifecycleTracker
 ) -> bool:
     """Rigorous check verifying validation result correlation and integrity."""
-    # 1. Hypothesis ID correlation
+    # 1. Basic type checks
+    if not isinstance(result, ValidationResult) or not isinstance(audit, ValidationAuditRecord) or not isinstance(tracker, JobLifecycleTracker):
+        return False
+
+    # 2. Hypothesis ID correlation
     if result.hypothesis_id != job.hypothesis_id or audit.hypothesis_id != job.hypothesis_id:
         return False
 
-    # 2. Status consistency between result, lifecycle tracker and audit record
+    # 3. Validation result logic consistency
+    if result.confirmed:
+        if not result.attempted:
+            return False
+        if result.status != ValidationStatus.VALIDATED:
+            return False
+
+    if not result.attempted:
+        if result.confirmed:
+            return False
+        if result.status == ValidationStatus.VALIDATED:
+            return False
+
+    # 4. Status consistency between result, lifecycle tracker and audit record
     if result.status == ValidationStatus.VALIDATED:
         if tracker.state != JobState.VALIDATED or audit.final_status != "VALIDATED":
             return False
-        # If validated, evidence references must have been supplied
         if not job.evidence_references:
             return False
-        # Confirm result has confirmed=True
-        if not result.confirmed:
+        if not result.confirmed or not result.attempted:
             return False
 
     elif result.status == ValidationStatus.NOT_CONFIRMED:
         if tracker.state != JobState.NOT_CONFIRMED or audit.final_status != "NOT_CONFIRMED":
             return False
-        if result.confirmed:
+        if result.confirmed or not result.attempted:
             return False
 
     elif result.status == ValidationStatus.TIMEOUT:
@@ -260,16 +275,22 @@ def verify_result_provenance(
             return False
 
     elif result.status == ValidationStatus.PREFLIGHT_ERROR:
-        # Preflight errors can map to lifecycle FAILED
-        if tracker.state != JobState.FAILED:
+        if tracker.state != JobState.FAILED or audit.final_status not in ("FAILED", "PREFLIGHT_ERROR"):
             return False
-        if result.confirmed:
+        if result.confirmed or result.attempted:
             return False
+
+    elif result.status == ValidationStatus.NOT_ATTEMPTED:
+        if tracker.state != JobState.FAILED and tracker.state != JobState.QUEUED:
+            return False
+        if result.confirmed or result.attempted:
+            return False
+
     else:
         return False
 
-    # 3. Time execution consistency
-    if audit.duration < 0 or result.duration is not None and result.duration < 0:
+    # 5. Time execution consistency
+    if audit.duration < 0 or (result.duration is not None and result.duration < 0):
         return False
 
     return True

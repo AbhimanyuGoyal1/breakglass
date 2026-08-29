@@ -23,13 +23,15 @@ class SandboxValidator(ABC):
     def validate(
         self,
         hypothesis: SecurityHypothesis,
-        repository_context: RepositoryReport
+        repository_context: RepositoryReport,
+        cancellation_event: Optional[threading.Event] = None
     ) -> ValidationResult:
         """Validates a SecurityHypothesis inside a sandboxed environment.
 
         Args:
             hypothesis: The hypothesis to validate.
             repository_context: The authoritative codebase report.
+            cancellation_event: Optional event to trigger cooperative cancellation.
 
         Returns:
             A ValidationResult representing the outcome.
@@ -47,7 +49,8 @@ class MockSandboxValidator(SandboxValidator):
     def validate(
         self,
         hypothesis: SecurityHypothesis,
-        repository_context: RepositoryReport
+        repository_context: RepositoryReport,
+        cancellation_event: Optional[threading.Event] = None
     ) -> ValidationResult:
         """Saves calls and returns configured or fallback validation results."""
         self.last_validated.append((hypothesis, repository_context))
@@ -201,7 +204,8 @@ class SandboxBackend(ABC):
         repo_path: str,
         payload_json: str,
         timeout: float,
-        max_output_bytes: int
+        max_output_bytes: int,
+        cancellation_event: Optional[threading.Event] = None
     ) -> Tuple[str, str, int, bool, bool, Optional[str]]:
         """Executes the validation runner.
 
@@ -232,7 +236,8 @@ class SubprocessSandboxBackend(SandboxBackend):
         repo_path: str,
         payload_json: str,
         timeout: float,
-        max_output_bytes: int
+        max_output_bytes: int,
+        cancellation_event: Optional[threading.Event] = None
     ) -> Tuple[str, str, int, bool, bool, Optional[str]]:
         cmd = [sys.executable, "-u", runner_path]
         env = dict(os.environ)
@@ -284,6 +289,11 @@ class SubprocessSandboxBackend(SandboxBackend):
         overflow_hit = False
 
         while True:
+            # Check cancellation first
+            if cancellation_event and cancellation_event.is_set():
+                timeout_hit = True
+                break
+
             while not q_out.empty():
                 try:
                     stdout_chunks.append(q_out.get_nowait())
@@ -386,7 +396,8 @@ class DockerSandboxBackend(SandboxBackend):
         repo_path: str,
         payload_json: str,
         timeout: float,
-        max_output_bytes: int
+        max_output_bytes: int,
+        cancellation_event: Optional[threading.Event] = None
     ) -> Tuple[str, str, int, bool, bool, Optional[str]]:
         # 1. Path containment validations on the host side before mounting
         try:
@@ -475,6 +486,11 @@ class DockerSandboxBackend(SandboxBackend):
         overflow_hit = False
 
         while True:
+            # Check cancellation first
+            if cancellation_event and cancellation_event.is_set():
+                timeout_hit = True
+                break
+
             while not q_out.empty():
                 try:
                     stdout_chunks.append(q_out.get_nowait())
@@ -633,7 +649,8 @@ class TrueForgeSandboxValidator(SandboxValidator):
         hypothesis: SecurityHypothesis,
         payload_json: str,
         runner_path: str,
-        repo_path: str
+        repo_path: str,
+        cancellation_event: Optional[threading.Event] = None
     ) -> ValidationResult:
         start_time = time.perf_counter()
 
@@ -642,7 +659,8 @@ class TrueForgeSandboxValidator(SandboxValidator):
             repo_path=repo_path,
             payload_json=payload_json,
             timeout=self.timeout_seconds,
-            max_output_bytes=self.max_output_bytes
+            max_output_bytes=self.max_output_bytes,
+            cancellation_event=cancellation_event
         )
 
         duration = time.perf_counter() - start_time
@@ -866,30 +884,40 @@ class TrueForgeSandboxValidator(SandboxValidator):
         self,
         hypothesis: SecurityHypothesis,
         repository_context: RepositoryReport,
-        runner_path: str
+        runner_path: str,
+        cancellation_event: Optional[threading.Event] = None
     ) -> ValidationResult:
         """Spawns an isolated Python subprocess sandbox runner to validate codebase."""
         payload = {
             "hypothesis": self._to_canonical_dict(hypothesis),
-            "report": self._to_canonical_dict(repository_context)
+            "report": self._to_canonical_dict(repository_context),
+            "authoritative_repo_root": os.path.abspath(repository_context.repository.root),
+            "config": {
+                "max_evidence_file_bytes": getattr(self, "max_evidence_file_bytes", 10 * 1024 * 1024)
+            }
         }
         json_input = json.dumps(payload)
 
         repo_path = os.path.abspath(repository_context.repository.root)
 
         backend = SubprocessSandboxBackend(self._reader_thread)
-        return self._execute_sandbox(backend, hypothesis, json_input, runner_path, repo_path)
+        return self._execute_sandbox(backend, hypothesis, json_input, runner_path, repo_path, cancellation_event)
 
     def _execute_container_sandbox(
         self,
         hypothesis: SecurityHypothesis,
         repository_context: RepositoryReport,
-        runner_path: str
+        runner_path: str,
+        cancellation_event: Optional[threading.Event] = None
     ) -> ValidationResult:
         """Spawns an isolated Docker container sandbox runner to validate codebase."""
         payload = {
             "hypothesis": self._to_canonical_dict(hypothesis),
-            "report": self._to_canonical_dict(repository_context)
+            "report": self._to_canonical_dict(repository_context),
+            "authoritative_repo_root": "/workspace",
+            "config": {
+                "max_evidence_file_bytes": getattr(self, "max_evidence_file_bytes", 10 * 1024 * 1024)
+            }
         }
         # Enforce that repository root is set to /workspace inside the container
         payload["report"]["repository"]["root"] = "/workspace"
@@ -898,12 +926,13 @@ class TrueForgeSandboxValidator(SandboxValidator):
         repo_path = os.path.abspath(repository_context.repository.root)
 
         backend = DockerSandboxBackend(self._reader_thread, image_name=self.image_name)
-        return self._execute_sandbox(backend, hypothesis, json_input, runner_path, repo_path)
+        return self._execute_sandbox(backend, hypothesis, json_input, runner_path, repo_path, cancellation_event)
 
     def validate(
         self,
         hypothesis: SecurityHypothesis,
-        repository_context: RepositoryReport
+        repository_context: RepositoryReport,
+        cancellation_event: Optional[threading.Event] = None
     ) -> ValidationResult:
         """Executes verification inside the TrueForge container workspace."""
         # Safety/Preflight checks: Enforce fail-closed for sandbox configuration errors
@@ -947,9 +976,9 @@ class TrueForgeSandboxValidator(SandboxValidator):
 
         # Dispatch execution
         if self.container_sandbox:
-            return self._execute_container_sandbox(hypothesis, repository_context, runner_path)
+            return self._execute_container_sandbox(hypothesis, repository_context, runner_path, cancellation_event)
         elif self.local_sandbox:
-            return self._execute_local_sandbox(hypothesis, repository_context, runner_path)
+            return self._execute_local_sandbox(hypothesis, repository_context, runner_path, cancellation_event)
 
         # Remote API orchestration mode placeholder:
         return ValidationResult(

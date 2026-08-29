@@ -3,7 +3,7 @@
 import json
 import sys
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
 
 def match_indicator_detail(ind: Dict[str, Any], detail: str) -> bool:
@@ -21,31 +21,87 @@ def match_indicator_detail(ind: Dict[str, Any], detail: str) -> bool:
         return detail == f"Security indicator: {evidence}"
 
 
+def check_file_evidence_streaming(
+    resolved_path: str,
+    evidence_str: str,
+    line_idx: Optional[int],
+    max_bytes: int = 10 * 1024 * 1024
+) -> Tuple[bool, str]:
+    """Streams and bounds file reading to search for evidence safely."""
+    evidence_bytes = evidence_str.encode("utf-8")
+    if not evidence_bytes:
+        return False, "Empty evidence string"
+
+    total_bytes = 0
+    if line_idx is not None:
+        if line_idx <= 0:
+            return False, f"Invalid line index: {line_idx}"
+
+        # Line-based search: iterate lines, check total byte size
+        try:
+            with open(resolved_path, "rb") as f:
+                current_line = 0
+                for line in f:
+                    total_bytes += len(line)
+                    if total_bytes > max_bytes:
+                        return False, f"File size exceeded the {max_bytes} bytes limit"
+                    current_line += 1
+                    if current_line == line_idx:
+                        # Decode target line
+                        line_str = line.decode("utf-8", errors="replace")
+                        if evidence_str in line_str:
+                            return True, f"Found evidence '{evidence_str}' at line {line_idx}"
+                        return False, f"Evidence '{evidence_str}' not found in line {line_idx} content"
+                return False, f"File has only {current_line} lines, line {line_idx} does not exist"
+        except Exception as e:
+            return False, f"Error reading file line: {str(e)}"
+    else:
+        # Whole-file search: read in overlapping chunks
+        chunk_size = 64 * 1024
+        overlap = len(evidence_bytes)
+        buffer = bytearray()
+        try:
+            with open(resolved_path, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        return False, f"File size exceeded the {max_bytes} bytes limit"
+                    buffer.extend(chunk)
+
+                    # Search in buffer
+                    idx = buffer.find(evidence_bytes)
+                    if idx != -1:
+                        return True, "Found evidence in file content"
+
+                    # Keep overlap at the end of buffer
+                    if len(buffer) > overlap:
+                        del buffer[:-overlap]
+
+            return False, "Evidence not found in file content"
+        except Exception as e:
+            return False, f"Error reading file: {str(e)}"
+
+
 def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Simulates/performs sandboxed validation of codebase reports and hypotheses."""
+    """Streams and validates repository evidence for a hypothesis safely inside the sandbox."""
     hypothesis = payload.get("hypothesis", {})
     report = payload.get("report", {})
+    config = payload.get("config", {})
 
     hyp_id = hypothesis.get("id", "")
     refs = hypothesis.get("evidence_references", [])
 
-    # Retrieve and normalize the sandbox/repository root
-    repo_info = report.get("repository", {})
-    if not isinstance(repo_info, dict):
-        return {
-            "hypothesis_id": hyp_id,
-            "status": "SANDBOX_ERROR",
-            "attempted": True,
-            "confirmed": False,
-            "confidence_delta": 0.0,
-            "evidence": "",
-            "stdout": "",
-            "stderr": "",
-            "metadata": {},
-            "error_message": "Missing repository summary object"
-        }
+    # Authoritative repository path resolution
+    sandbox_root = payload.get("authoritative_repo_root")
+    if not isinstance(sandbox_root, str) or not sandbox_root.strip():
+        # Fallback to report repository root if none passed explicitly (backwards compatibility)
+        repo_info = report.get("repository", {})
+        if isinstance(repo_info, dict):
+            sandbox_root = repo_info.get("root")
 
-    sandbox_root = repo_info.get("root")
     if not isinstance(sandbox_root, str) or not sandbox_root.strip():
         return {
             "hypothesis_id": hyp_id,
@@ -57,12 +113,33 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
             "stdout": "",
             "stderr": "",
             "metadata": {},
-            "error_message": "Missing or invalid repository root directory path"
+            "error_message": "Missing repository summary root path"
         }
+
+    # Security check: Match report root with authoritative sandbox root to detect configuration tampering
+    repo_info = report.get("repository", {})
+    if isinstance(repo_info, dict):
+        report_root = repo_info.get("root")
+        if report_root:
+            report_root_norm = os.path.normcase(os.path.abspath(report_root))
+            sandbox_root_norm = os.path.normcase(os.path.abspath(sandbox_root))
+            if report_root_norm != sandbox_root_norm:
+                return {
+                    "hypothesis_id": hyp_id,
+                    "status": "SANDBOX_ERROR",
+                    "attempted": True,
+                    "confirmed": False,
+                    "confidence_delta": 0.0,
+                    "evidence": "",
+                    "stdout": "",
+                    "stderr": "",
+                    "metadata": {},
+                    "error_message": f"Security violation: report root '{report_root}' does not match authoritative root '{sandbox_root}'"
+                }
 
     sandbox_root_abs = os.path.abspath(sandbox_root)
 
-    # Simple validation rule check: check if code exists and contains the evidence
+    # Resolve indicators
     indicators = report.get("security_indicators", [])
     if not isinstance(indicators, list):
         indicators = []
@@ -104,7 +181,11 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
 
             # Enforce sandbox boundary containment to reject path traversal and symlink escapes
-            if not (resolved_path.startswith(sandbox_root_abs + os.sep) or resolved_path == sandbox_root_abs):
+            # Normalize with trailing slash to prevent suffix containment bypass (e.g. /workspace-backup vs /workspace)
+            sandbox_root_norm = os.path.join(sandbox_root_abs, "")
+            resolved_path_norm = os.path.join(resolved_path, "")
+
+            if not (resolved_path.startswith(sandbox_root_norm) or resolved_path == sandbox_root_abs):
                 return {
                     "hypothesis_id": hyp_id,
                     "status": "SANDBOX_ERROR",
@@ -119,41 +200,31 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
                 }
 
             if os.path.exists(resolved_path) and os.path.isfile(resolved_path):
-                try:
-                    with open(resolved_path, "r", encoding="utf-8") as f:
-                        lines = f.readlines()
-                    line_idx = ind.get("line")
-                    if line_idx is not None and 1 <= line_idx <= len(lines):
-                        content = lines[line_idx - 1]
-                        if evidence_str in content:
-                            confirmed = True
-                            details_log.append(f"Found evidence '{evidence_str}' at {file_path}:{line_idx}")
-                        else:
-                            details_log.append(f"Evidence '{evidence_str}' not found in line content: '{content.strip()}'")
-                    else:
-                        # Scan whole file
-                        file_content = "".join(lines)
-                        if evidence_str in file_content:
-                            confirmed = True
-                            details_log.append(f"Found evidence '{evidence_str}' in file {file_path}")
-                        else:
-                            details_log.append(f"Evidence '{evidence_str}' not found in file {file_path}")
-                except Exception as e:
-                    # Fail closed on read errors
-                    return {
-                        "hypothesis_id": hyp_id,
-                        "status": "SANDBOX_ERROR",
-                        "attempted": True,
-                        "confirmed": False,
-                        "confidence_delta": 0.0,
-                        "evidence": "",
-                        "stdout": "",
-                        "stderr": "",
-                        "metadata": {},
-                        "error_message": f"Failed to read file {file_path}: {str(e)}"
-                    }
+                # Enforce dynamic maximum read limit (default 10MB)
+                max_bytes = config.get("max_evidence_file_bytes", 10 * 1024 * 1024)
+                line_idx = ind.get("line")
+
+                success, search_detail = check_file_evidence_streaming(resolved_path, evidence_str, line_idx, max_bytes)
+                if success:
+                    confirmed = True
+                    details_log.append(f"Found evidence '{evidence_str}' at {file_path}:{line_idx or 'all'}")
+                else:
+                    details_log.append(search_detail)
+                    # If file size limits were exceeded, return SANDBOX_ERROR to fail closed
+                    if "exceeded" in search_detail:
+                        return {
+                            "hypothesis_id": hyp_id,
+                            "status": "SANDBOX_ERROR",
+                            "attempted": True,
+                            "confirmed": False,
+                            "confidence_delta": 0.0,
+                            "evidence": "",
+                            "stdout": "",
+                            "stderr": "",
+                            "metadata": {},
+                            "error_message": f"File read safety error: {search_detail}"
+                        }
             else:
-                # If file does not exist, return NOT_CONFIRMED (do not fabricate confirmation!)
                 confirmed = False
                 details_log.append(f"Evidence file does not exist: {file_path}")
 

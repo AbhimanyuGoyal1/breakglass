@@ -586,13 +586,30 @@ class ValidationEngine:
 
     def _run_with_timeout(self, hyp: SecurityHypothesis, report: RepositoryReport) -> ValidationResult:
         """Invokes SandboxValidator inside a thread pool with a timeout boundary, shutting down non-blockingly."""
+        import threading
+        import inspect
+        cancellation_event = threading.Event()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(self.validator.validate, hyp, report)
+
+        # Check if the validator's validate method accepts at least 3 parameters or var-positional
+        sig = inspect.signature(self.validator.validate)
+        params = list(sig.parameters.values())
+        has_cancellation = len(params) >= 3 or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD or p.kind == inspect.Parameter.VAR_POSITIONAL
+            for p in params
+        )
+
+        if has_cancellation:
+            future = executor.submit(self.validator.validate, hyp, report, cancellation_event)
+        else:
+            future = executor.submit(self.validator.validate, hyp, report)
+
         try:
             result = future.result(timeout=self.config.timeout_seconds)
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=True)
             return result
         except concurrent.futures.TimeoutError:
+            cancellation_event.set()
             executor.shutdown(wait=False)
             return ValidationResult(
                 hypothesis_id=hyp.id or "",
@@ -602,6 +619,7 @@ class ValidationEngine:
                 error_message=f"Validation timed out after {self.config.timeout_seconds} seconds"
             )
         except Exception as e:
+            cancellation_event.set()
             executor.shutdown(wait=False)
             raise e
 
