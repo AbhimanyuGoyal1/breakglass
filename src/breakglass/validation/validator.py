@@ -918,10 +918,14 @@ class TrueForgeSandboxValidator(SandboxValidator):
 
         # 1. Authoritative runner path resolution (CWD-independent)
         try:
-            import breakglass.validation.sandbox_runner as sandbox_runner
-            runner_path = os.path.abspath(os.path.realpath(sandbox_runner.__file__))
-            if runner_path.endswith('.pyc'):
-                runner_path = runner_path[:-1]
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            runner_path = os.path.abspath(os.path.realpath(os.path.join(current_dir, "sandbox_runner.py")))
+
+            if not (os.path.exists(runner_path) and os.path.isfile(runner_path)):
+                import breakglass.validation.sandbox_runner as sandbox_runner
+                runner_path = os.path.abspath(os.path.realpath(sandbox_runner.__file__))
+                if runner_path.endswith('.pyc'):
+                    runner_path = runner_path[:-1]
 
             # Verify file exists and is a regular file
             if not (os.path.exists(runner_path) and os.path.isfile(runner_path)):
