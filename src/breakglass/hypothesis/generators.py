@@ -12,7 +12,8 @@ def validate_and_create_evidence_ref(
     file_rel_path: str,
     line: Optional[int],
     detail: str,
-    repo_root: str
+    repo_root: str,
+    report: Optional[RepositoryReport] = None
 ) -> Optional[EvidenceReference]:
     """Validates that the file lies inside the repository root, redacts secrets, and returns an EvidenceReference."""
     try:
@@ -26,12 +27,21 @@ def validate_and_create_evidence_ref(
         from breakglass.inspection.indicators import redact_secrets
         clean_detail = redact_secrets(detail)
         
-        return EvidenceReference(
+        ref = EvidenceReference(
             type=ref_type,
             file=file_rel_path.replace("\\", "/"),
             line=line,
             detail=clean_detail
         )
+
+        if report is not None:
+            from breakglass.evidence.auth import authenticate_evidence_reference
+            valid, auth_detail = authenticate_evidence_reference(ref, report, repo_root)
+            if not valid:
+                return None
+            ref.detail = auth_detail
+
+        return ref
     except Exception:
         return None
 
@@ -261,10 +271,10 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                     hyp_id = generate_hypothesis_id("command_injection", identity, is_llm=False)
                     
                     ev_ref1 = validate_and_create_evidence_ref(
-                        "security_indicator", ind.file, ind.line, f"Subprocess call: {ind.evidence}", repo_root
+                        "security_indicator", ind.file, ind.line, f"Subprocess call: {ind.evidence}", repo_root, report
                     )
                     ev_ref2 = validate_and_create_evidence_ref(
-                        "route", route.file, route.line, f"Route: {route.method} {route.pattern}", repo_root
+                        "route", route.file, route.line, f"Route: {route.method} {route.pattern}", repo_root, report
                     )
                     if ev_ref1 and ev_ref2:
                         refs = [ev_ref1, ev_ref2]
@@ -319,10 +329,10 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                     hyp_id = generate_hypothesis_id("sql_injection", identity, is_llm=False)
                     
                     ev_ref1 = validate_and_create_evidence_ref(
-                        "security_indicator", ind.file, ind.line, f"Database indicator: {ind.evidence}", repo_root
+                        "security_indicator", ind.file, ind.line, f"Database indicator: {ind.evidence}", repo_root, report
                     )
                     ev_ref2 = validate_and_create_evidence_ref(
-                        "route", route.file, route.line, f"Route: {route.method} {route.pattern}", repo_root
+                        "route", route.file, route.line, f"Route: {route.method} {route.pattern}", repo_root, report
                     )
                     if ev_ref1 and ev_ref2:
                         refs = [ev_ref1, ev_ref2]
@@ -373,10 +383,10 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                     hyp_id = generate_hypothesis_id("remote_code_execution", identity, is_llm=False)
                     
                     ev_ref1 = validate_and_create_evidence_ref(
-                        "security_indicator", ind.file, ind.line, f"Serialization call: {ind.evidence}", repo_root
+                        "security_indicator", ind.file, ind.line, f"Serialization call: {ind.evidence}", repo_root, report
                     )
                     ev_ref2 = validate_and_create_evidence_ref(
-                        "entry_point", ep.file, ep.line, f"Entry point: {ep.type} ({ep.description})", repo_root
+                        "entry_point", ep.file, ep.line, f"Entry point: {ep.type} ({ep.description})", repo_root, report
                     )
                     if ev_ref1 and ev_ref2:
                         refs = [ev_ref1, ev_ref2]
@@ -418,7 +428,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             hyp_id = generate_hypothesis_id("credential_exposure", identity, is_llm=False)
             
             ev_ref = validate_and_create_evidence_ref(
-                "security_indicator", ind.file, ind.line, f"Cloud/Secrets indicator: {ind.evidence}", repo_root
+                "security_indicator", ind.file, ind.line, f"Cloud/Secrets indicator: {ind.evidence}", repo_root, report
             )
             if ev_ref:
                 refs = [ev_ref]
@@ -440,7 +450,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
         try:
             if ind.category == "secret_config":
                 ref = validate_and_create_evidence_ref(
-                    "security_indicator", ind.file, ind.line, f"Exposed secret config: {ind.evidence}", repo_root
+                    "security_indicator", ind.file, ind.line, f"Exposed secret config: {ind.evidence}", repo_root, report
                 )
                 if ref:
                     identity = {"rule": "ind_secret", "file": ind.file, "line": ind.line, "evidence": ind.evidence}
@@ -464,7 +474,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
         try:
             if ind.category in ("authentication", "authorization"):
                 ref = validate_and_create_evidence_ref(
-                    "security_indicator", ind.file, ind.line, f"Access control: {ind.evidence}", repo_root
+                    "security_indicator", ind.file, ind.line, f"Access control: {ind.evidence}", repo_root, report
                 )
                 if ref:
                     identity = {"rule": "ind_auth", "file": ind.file, "line": ind.line, "evidence": ind.evidence}
@@ -488,7 +498,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
         try:
             if ind.category == "filesystem":
                 ref = validate_and_create_evidence_ref(
-                    "security_indicator", ind.file, ind.line, f"Filesystem access: {ind.evidence}", repo_root
+                    "security_indicator", ind.file, ind.line, f"Filesystem access: {ind.evidence}", repo_root, report
                 )
                 if ref:
                     identity = {"rule": "ind_file", "file": ind.file, "line": ind.line, "evidence": ind.evidence}
@@ -513,7 +523,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             target_deps = [d for d in m.dependencies if d.lower() in ("express", "fastapi", "flask", "django", "requests", "boto3", "actix-web")]
             if target_deps:
                 ref = validate_and_create_evidence_ref(
-                    "file", m.file, None, f"Dependency manifest containing framework usage: {m.ecosystem}", repo_root
+                    "file", m.file, None, f"Dependency manifest containing framework usage: {m.ecosystem}", repo_root, report
                 )
                 if ref:
                     identity = {"rule": "manifest_deps", "file": m.file, "deps": sorted(target_deps)}
@@ -538,7 +548,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             r_lower = r.pattern.lower()
             if any(x in r_lower for x in ("debug", "dev", "status", "health", "admin", "metrics")):
                 ref = validate_and_create_evidence_ref(
-                    "route", r.file, r.line, f"Route: {r.method} {r.pattern}", repo_root
+                    "route", r.file, r.line, f"Route: {r.method} {r.pattern}", repo_root, report
                 )
                 if ref:
                     identity = {"rule": "route_debug", "file": r.file, "line": r.line, "pattern": r.pattern}
@@ -564,7 +574,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             for conf_f in getattr(summary, "config_files", []):
                 f_name = os.path.basename(conf_f).lower()
                 if any(x in f_name for x in ("secret", "private", "key", "cred", "auth", "token", ".env", "passwd", "shadow")):
-                    ref = validate_and_create_evidence_ref("file", conf_f, None, "Suspicious configuration file", repo_root)
+                    ref = validate_and_create_evidence_ref("file", conf_f, None, "Suspicious configuration file", repo_root, report)
                     if ref:
                         identity = {"rule": "summary_config", "file": conf_f}
                         hyp_id = generate_hypothesis_id("insecure_config", identity, is_llm=False)
@@ -588,7 +598,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             for cicd_f in getattr(summary, "cicd_configs", []):
                 f_name = os.path.basename(cicd_f).lower()
                 if any(x in f_name for x in ("deploy", "publish", "release", "admin", "secret")):
-                    ref = validate_and_create_evidence_ref("file", cicd_f, None, "CI/CD Pipeline file", repo_root)
+                    ref = validate_and_create_evidence_ref("file", cicd_f, None, "CI/CD Pipeline file", repo_root, report)
                     if ref:
                         identity = {"rule": "summary_cicd", "file": cicd_f}
                         hyp_id = generate_hypothesis_id("dangerous_cicd", identity, is_llm=False)
@@ -612,7 +622,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             for dock_f in getattr(summary, "docker_configs", []):
                 f_name = os.path.basename(dock_f).lower()
                 if any(x in f_name for x in ("deploy", "prod", "priv", "root", "docker-compose")):
-                    ref = validate_and_create_evidence_ref("file", dock_f, None, "Container deployment file", repo_root)
+                    ref = validate_and_create_evidence_ref("file", dock_f, None, "Container deployment file", repo_root, report)
                     if ref:
                         identity = {"rule": "summary_docker", "file": dock_f}
                         hyp_id = generate_hypothesis_id("infrastructure_misconfig", identity, is_llm=False)
@@ -634,7 +644,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
     for ep in unique_eps:
         try:
             if ep.type.lower() not in ("cli/script", "main", "cli", "script"):
-                ref = validate_and_create_evidence_ref("entry_point", ep.file, ep.line, f"Entry point: {ep.type}", repo_root)
+                ref = validate_and_create_evidence_ref("entry_point", ep.file, ep.line, f"Entry point: {ep.type}", repo_root, report)
                 if ref:
                     identity = {"rule": "summary_ep", "file": ep.file, "type": ep.type, "line": ep.line}
                     hyp_id = generate_hypothesis_id("network_exposure", identity, is_llm=False)

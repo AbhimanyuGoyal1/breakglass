@@ -203,52 +203,9 @@ class ValidationEngine:
 
     def _resolve_and_validate_evidence(self, ref: EvidenceReference, report: RepositoryReport) -> Tuple[bool, str]:
         """Resolves untrusted evidence reference against authoritative report findings."""
-        if not isinstance(ref, EvidenceReference):
-            return False, ""
-        if not isinstance(ref.type, str) or not isinstance(ref.file, str) or not isinstance(ref.detail, str):
-            return False, ""
-        if ref.line is not None and (not isinstance(ref.line, int) or isinstance(ref.line, bool)):
-            return False, ""
-
-        repo = report.repository
-        valid_files = set()
-        for list_attr in (repo.config_files, repo.docker_configs, repo.cicd_configs,
-                          repo.infrastructure_configs, repo.test_files):
-            valid_files.update(list_attr)
-
-        if ref.type == "security_indicator":
-            for ind in report.security_indicators:
-                if ind.file == ref.file and (ind.line == ref.line or (ind.line is None and ref.line is None)):
-                    if self._match_indicator_detail(ind, ref.detail):
-                        return True, ref.detail
-            return False, ""
-        elif ref.type == "route":
-            for r in report.routes:
-                if r.file == ref.file and r.line == ref.line:
-                    return True, f"Route: {r.method} {r.pattern}"
-            return False, ""
-        elif ref.type == "entry_point":
-            for ep in report.entry_points:
-                if ep.file == ref.file and ep.line == ref.line:
-                    return True, f"Entry point: {ep.type} ({ep.description})"
-            return False, ""
-        elif ref.type == "file":
-            # Plain file reference must have no line numbers
-            if ref.line is not None:
-                return False, ""
-            # Gather files from any discovered indicators/routes/entry points to be comprehensive
-            for r in report.routes:
-                valid_files.add(r.file)
-            for ep in report.entry_points:
-                valid_files.add(ep.file)
-            for ind in report.security_indicators:
-                valid_files.add(ind.file)
-
-            if ref.file in valid_files:
-                return True, f"File: {ref.file}"
-            return False, ""
-
-        return False, ""
+        from breakglass.evidence.auth import authenticate_evidence_reference
+        repo_root = getattr(getattr(report, "repository", None), "root", "") or ""
+        return authenticate_evidence_reference(ref, report, repo_root)
 
     def _authenticate_hypothesis_id(self, hypothesis: SecurityHypothesis, report: RepositoryReport) -> bool:
         """Recomputes expected hypothesis ID from canonical data and compares it to the supplied ID."""

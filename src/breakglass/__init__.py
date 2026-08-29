@@ -25,6 +25,14 @@ from breakglass.validation import (
     ValidationEngine
 )
 from breakglass.hypothesis import SecurityHypothesisGenerator, HypothesisConfig
+from breakglass.evidence import (
+    EvidenceNode,
+    EvidenceEdge,
+    EvidenceGraphConfig,
+    EvidenceGraph,
+    authenticate_evidence_reference,
+    EvidenceGraphBuilder
+)
 
 __all__ = [
     "inspect_repository",
@@ -49,7 +57,13 @@ __all__ = [
     "ValidationConfig",
     "ValidationEngine",
     "SecurityHypothesisGenerator",
-    "HypothesisConfig"
+    "HypothesisConfig",
+    "EvidenceNode",
+    "EvidenceEdge",
+    "EvidenceGraphConfig",
+    "EvidenceGraph",
+    "authenticate_evidence_reference",
+    "EvidenceGraphBuilder"
 ]
 __version__ = "0.1.0"
 
