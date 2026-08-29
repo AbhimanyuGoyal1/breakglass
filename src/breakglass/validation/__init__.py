@@ -13,6 +13,18 @@ from breakglass.validation.engine import (
     ValidationConfig,
     ValidationEngine
 )
+from breakglass.validation.pipeline import (
+    JobState,
+    ValidationJob,
+    JobLifecycleTracker,
+    ValidationAuditRecord,
+    verify_result_provenance
+)
+from breakglass.validation.orchestrator import (
+    OrchestratorConfig,
+    AggregatedValidationReport,
+    ValidationOrchestrator
+)
 
 __all__ = [
     "ValidationStatus",
@@ -21,5 +33,13 @@ __all__ = [
     "MockSandboxValidator",
     "TrueForgeSandboxValidator",
     "ValidationConfig",
-    "ValidationEngine"
+    "ValidationEngine",
+    "JobState",
+    "ValidationJob",
+    "JobLifecycleTracker",
+    "ValidationAuditRecord",
+    "verify_result_provenance",
+    "OrchestratorConfig",
+    "AggregatedValidationReport",
+    "ValidationOrchestrator"
 ]

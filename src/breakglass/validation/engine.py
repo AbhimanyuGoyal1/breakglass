@@ -23,8 +23,8 @@ class ValidationConfig:
 
     def validate(self) -> None:
         """Validates configuration parameters strictly."""
-        if not isinstance(self.timeout_seconds, (int, float)) or self.timeout_seconds <= 0 or isinstance(self.timeout_seconds, bool):
-            raise ValueError("timeout_seconds must be a positive number")
+        if not isinstance(self.timeout_seconds, (int, float)) or isinstance(self.timeout_seconds, bool) or not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be a finite positive number")
         if not isinstance(self.max_output_bytes, int) or self.max_output_bytes <= 0 or isinstance(self.max_output_bytes, bool):
             raise ValueError("max_output_bytes must be a positive integer")
         if not isinstance(self.max_hypotheses_per_run, int) or self.max_hypotheses_per_run <= 0 or isinstance(self.max_hypotheses_per_run, bool):
@@ -42,6 +42,88 @@ class ValidationEngine:
         self.validator = validator
         self.config = config or ValidationConfig()
         self.config.validate()
+
+    def validate_hypothesis_shape(self, hyp: Any, report: RepositoryReport) -> Tuple[bool, Optional[SecurityHypothesis], str]:
+        """Validates structural shape, types, authentication, and eligibility of a hypothesis.
+
+        Returns:
+            Tuple of (is_valid, canonical_hypothesis, error_message)
+        """
+        try:
+            # 1. Base class type checks
+            if not isinstance(hyp, SecurityHypothesis):
+                return False, None, "Invalid hypothesis shape: Not a SecurityHypothesis instance"
+
+            # 2. Hypothesis ID checks
+            if not hasattr(hyp, "id") or not isinstance(hyp.id, str) or not hyp.id.strip():
+                return False, None, "Invalid hypothesis shape: Empty or non-string ID"
+
+            # 3. Core field checks
+            if not hasattr(hyp, "title") or not isinstance(hyp.title, str):
+                return False, None, "Invalid hypothesis shape: title must be a string"
+            if not hasattr(hyp, "description") or not isinstance(hyp.description, str):
+                return False, None, "Invalid hypothesis shape: description must be a string"
+            if not hasattr(hyp, "category") or not isinstance(hyp.category, str):
+                return False, None, "Invalid hypothesis shape: category must be a string"
+
+            # 4. Evidence references collection checks
+            if not hasattr(hyp, "evidence_references") or not isinstance(hyp.evidence_references, list) or not hyp.evidence_references:
+                return False, None, "Validation job preflight failed: Hypothesis has no evidence references"
+
+            # 5. Individual evidence reference type/value checks
+            canonical_references = []
+            for ref in hyp.evidence_references:
+                if not isinstance(ref, EvidenceReference):
+                    return False, None, "Invalid hypothesis shape: evidence reference is not an EvidenceReference instance"
+
+                # Resolve and validate on the host
+                valid, auth_detail = self._resolve_and_validate_evidence(ref, report)
+                if not valid:
+                    return False, None, "Eligibility check failed: Evidence reference failed to resolve or is fabricated"
+
+                canonical_references.append(
+                    EvidenceReference(
+                        type=ref.type,
+                        file=ref.file,
+                        line=ref.line,
+                        detail=auth_detail
+                    )
+                )
+
+            # Sort deterministically
+            canonical_references.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
+
+            canonical_hyp = SecurityHypothesis(
+                id=hyp.id,
+                title=hyp.title,
+                description=hyp.description,
+                category=hyp.category,
+                severity=getattr(hyp, "severity", "CRITICAL") or "CRITICAL",
+                confidence=float(getattr(hyp, "confidence", 0.8) or 0.8),
+                evidence_references=canonical_references,
+                rationale=getattr(hyp, "rationale", "") or ""
+            )
+
+            # 6. Re-authenticate ID
+            if not self._authenticate_hypothesis_id(canonical_hyp, report):
+                return False, None, "Hypothesis authentication failed: ID does not match identity"
+
+            # 7. Eligibility check
+            eligible, reason = self.check_eligibility(canonical_hyp, report)
+            if not eligible:
+                return False, None, f"Eligibility check failed: {reason}"
+
+            # 8. Request Payload Size Bounding
+            payload_bytes = self._calculate_payload_bytes(canonical_hyp, report)
+            if payload_bytes > self.config.max_payload_bytes:
+                return False, None, (
+                    f"Validation rejected: request payload size of {payload_bytes} bytes "
+                    f"exceeds the configured max_payload_bytes limit of {self.config.max_payload_bytes} bytes"
+                )
+
+            return True, canonical_hyp, ""
+        except Exception as e:
+            return False, None, f"Validation preflight encountered unexpected error: {str(e)}"
 
     def _truncate_utf8(self, text: str, max_bytes: int) -> str:
         """Truncates a string to ensure its UTF-8 encoding is strictly within max_bytes."""
@@ -586,13 +668,30 @@ class ValidationEngine:
 
     def _run_with_timeout(self, hyp: SecurityHypothesis, report: RepositoryReport) -> ValidationResult:
         """Invokes SandboxValidator inside a thread pool with a timeout boundary, shutting down non-blockingly."""
+        import threading
+        import inspect
+        cancellation_event = threading.Event()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(self.validator.validate, hyp, report)
+
+        # Check if the validator's validate method accepts at least 3 parameters or var-positional
+        sig = inspect.signature(self.validator.validate)
+        params = list(sig.parameters.values())
+        has_cancellation = len(params) >= 3 or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD or p.kind == inspect.Parameter.VAR_POSITIONAL
+            for p in params
+        )
+
+        if has_cancellation:
+            future = executor.submit(self.validator.validate, hyp, report, cancellation_event)
+        else:
+            future = executor.submit(self.validator.validate, hyp, report)
+
         try:
             result = future.result(timeout=self.config.timeout_seconds)
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=True)
             return result
         except concurrent.futures.TimeoutError:
+            cancellation_event.set()
             executor.shutdown(wait=False)
             return ValidationResult(
                 hypothesis_id=hyp.id or "",
@@ -602,6 +701,7 @@ class ValidationEngine:
                 error_message=f"Validation timed out after {self.config.timeout_seconds} seconds"
             )
         except Exception as e:
+            cancellation_event.set()
             executor.shutdown(wait=False)
             raise e
 
@@ -616,18 +716,19 @@ class ValidationEngine:
 
         # 1. Filter out malformed/invalid hypotheses shape before sorting
         for hyp in hypotheses:
-            if not isinstance(hyp, SecurityHypothesis) or not hyp.id or not isinstance(hyp.id, str):
+            is_valid, canonical_hyp, err_msg = self.validate_hypothesis_shape(hyp, report)
+            if not is_valid:
                 results.append(
                     ValidationResult(
-                        hypothesis_id=hyp.id if (hasattr(hyp, "id") and isinstance(hyp.id, str)) else "",
+                        hypothesis_id=getattr(hyp, "id", "") if (hasattr(hyp, "id") and isinstance(hyp.id, str)) else "",
                         status=ValidationStatus.INVALID_HYPOTHESIS,
                         attempted=False,
                         confirmed=False,
-                        error_message="Invalid hypothesis shape: Not a valid SecurityHypothesis instance, or ID is empty/not a string"
+                        error_message=err_msg
                     )
                 )
             else:
-                valid_hypotheses.append(hyp)
+                valid_hypotheses.append(canonical_hyp)
 
         # 2. Sort deterministically by hypothesis ID
         sorted_hypotheses = sorted(valid_hypotheses, key=lambda x: x.id)
@@ -636,84 +737,10 @@ class ValidationEngine:
         limited_hypotheses = sorted_hypotheses[:self.config.max_hypotheses_per_run]
 
         for hyp in limited_hypotheses:
-            # Reconstruct evidence with authoritative details before validation
-            canonical_references = []
-            has_invalid_ref = False
-            for ref in hyp.evidence_references:
-                valid, auth_detail = self._resolve_and_validate_evidence(ref, report)
-                if not valid:
-                    has_invalid_ref = True
-                    break
-                canonical_references.append(
-                    EvidenceReference(
-                        type=ref.type,
-                        file=ref.file,
-                        line=ref.line,
-                        detail=auth_detail
-                    )
-                )
-
-            if has_invalid_ref:
-                results.append(
-                    ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message="Eligibility check failed: Evidence reference failed to resolve or is fabricated"
-                    )
-                )
-                continue
-
-            canonical_references.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
-
-            # Hypotheses passed to sandbox contains strictly canonicalized authoritative evidence
-            canonical_hyp = SecurityHypothesis(
-                id=hyp.id,
-                title=hyp.title,
-                description=hyp.description,
-                category=hyp.category,
-                severity=hyp.severity,
-                confidence=hyp.confidence,
-                evidence_references=canonical_references,
-                rationale=hyp.rationale
-            )
-
-            # 3. Eligibility Check (This resolves references and reconstructs canonical fields)
-            eligible, reason = self.check_eligibility(canonical_hyp, report)
-            if not eligible:
-                results.append(
-                    ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message=f"Eligibility check failed: {reason}"
-                    )
-                )
-                continue
-
-            # 4. Request Payload Size Bounding
-            payload_bytes = self._calculate_payload_bytes(canonical_hyp, report)
-            if payload_bytes > self.config.max_payload_bytes:
-                results.append(
-                    ValidationResult(
-                        hypothesis_id=hyp.id,
-                        status=ValidationStatus.INVALID_HYPOTHESIS,
-                        attempted=False,
-                        confirmed=False,
-                        error_message=(
-                            f"Validation rejected: request payload size of {payload_bytes} bytes "
-                            f"exceeds the configured max_payload_bytes limit of {self.config.max_payload_bytes} bytes"
-                        )
-                    )
-                )
-                continue
-
             # 5. Invoke Sandbox Validator safely under timeout boundary
             try:
                 start_time = time.perf_counter()
-                raw_result = self._run_with_timeout(canonical_hyp, report)
+                raw_result = self._run_with_timeout(hyp, report)
                 duration = time.perf_counter() - start_time
 
                 # Validate result integrity strictly
