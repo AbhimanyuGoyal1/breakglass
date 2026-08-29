@@ -43,6 +43,8 @@ class ValidationEngine:
         self.validator = validator
         self.config = config or ValidationConfig()
         self.config.validate()
+        if hasattr(self.validator, "timeout_seconds"):
+            self.validator.timeout_seconds = self.config.timeout_seconds
 
     def validate_hypothesis_shape(self, hyp: Any, report: RepositoryReport) -> Tuple[bool, Optional[SecurityHypothesis], str]:
         """Validates structural shape, types, authentication, and eligibility of a hypothesis.
@@ -765,6 +767,8 @@ class ValidationEngine:
         report: RepositoryReport
     ) -> List[ValidationResult]:
         """Orchestrates sandbox validation for a collection of hypotheses."""
+        if hasattr(self.validator, "timeout_seconds"):
+            self.validator.timeout_seconds = self.config.timeout_seconds
         results = []
         valid_hypotheses = []
 

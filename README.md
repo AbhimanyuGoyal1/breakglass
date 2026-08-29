@@ -55,6 +55,31 @@ Controlled Action
 
 ---
 
+## Installation
+
+BREAKGLASS is designed to be lightweight by default, relying on offline deterministic reasoning engines for codebase analysis.
+
+To install BREAKGLASS with the default deterministic analysis capabilities:
+```bash
+pip install -e .
+```
+
+To enable LLM-assisted reasoning using Google Gemini, you must install the optional `llm` extra package dependencies:
+```bash
+pip install -e ".[llm]"
+```
+
+Additionally, to use Gemini-assisted reasoning, you must configure a Gemini API key. Ensure that either the `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variable is exported:
+```bash
+# On Linux/macOS
+export GEMINI_API_KEY="your-api-key-here"
+
+# On Windows (PowerShell)
+$env:GEMINI_API_KEY="your-api-key-here"
+```
+
+---
+
 ## How to Run Inspection
 
 ### Programmatic Python API
@@ -77,6 +102,38 @@ for indicator in report.security_indicators:
 # Export structured report to JSON
 json_output = report.to_json(indent=2)
 ```
+
+### Command-Line Interface (CLI)
+
+BREAKGLASS provides a command-line interface to perform end-to-end repository assessment, reasoning, and validation:
+
+```bash
+# Basic run: inspect repository statically and generate hypotheses
+breakglass /path/to/target/repository
+
+# Run with LLM-assisted reasoning expansion
+breakglass /path/to/target/repository --llm
+
+# Run with sandbox validation of eligible hypotheses enabled (using Mock validator)
+breakglass /path/to/target/repository --validate
+
+# Run with sandbox validation using TrueForge local subprocess or container sandbox
+breakglass /path/to/target/repository --validate --validator local
+breakglass /path/to/target/repository --validate --validator container
+
+# Run validation and export structured JSON assessment report to a file
+breakglass /path/to/target/repository --validate --output report.json
+```
+
+Options:
+* `target_path` (positional): Local directory path of the target repository to inspect.
+* `--output`, `-o`: Output JSON file path to write the structured assessment report.
+* `--llm`: Enable LLM-assisted reasoning using Google Gemini (requires `GEMINI_API_KEY` or `GOOGLE_API_KEY` in environment variables).
+* `--validate`: Enable sandbox validation of eligible hypotheses.
+* `--validator`: Sandbox validator backend selection (`mock` [default], `local`, `container`, `trueforge`).
+* `--max-hypotheses`: Maximum number of hypotheses to validate in a single run (default: 10).
+* `--timeout`: Timeout in seconds for validation execution (default: 30.0).
+* `--verbose`, `-v`: Enable verbose logging.
 
 ### Agent Reasoning (Security Hypothesis Layer)
 
