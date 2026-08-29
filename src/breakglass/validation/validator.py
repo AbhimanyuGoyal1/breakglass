@@ -81,6 +81,27 @@ class _CombinedOutputCounter:
             return self._value
 
 
+def _is_contained_in(parent: str, child: str) -> bool:
+    """Verifies component-aware containment of child path inside parent path.
+
+    Prevents substring/prefix overmatching and symlink/junction escapes.
+    """
+    try:
+        p_canon = os.path.normcase(os.path.abspath(os.path.realpath(parent)))
+        c_canon = os.path.normcase(os.path.abspath(os.path.realpath(child)))
+
+        # Verify drive letters match on Windows to avoid ValueError in commonpath
+        p_drive, _ = os.path.splitdrive(p_canon)
+        c_drive, _ = os.path.splitdrive(c_canon)
+        if p_drive != c_drive:
+            return False
+
+        common = os.path.commonpath([p_canon, c_canon])
+        return os.path.normcase(common) == p_canon
+    except Exception:
+        return False
+
+
 def _validate_mount_path(path: str) -> str:
     """Validates and canonicalizes a path for mounting or sandboxed validation.
 
@@ -101,34 +122,70 @@ def _validate_mount_path(path: str) -> str:
         raise ValueError(f"UNC paths are not allowed for sandbox mounts: {resolved}")
 
     # Check against forbidden paths
-    forbidden_prefixes = []
+    forbidden_directories = []
+
     if os.name == 'nt':
-        forbidden_prefixes = [
-            os.path.normcase("C:\\Windows"),
-            os.path.normcase("C:\\Program Files"),
-            os.path.normcase("C:\\Program Files (x86)"),
-            os.path.normcase("C:\\Users\\Default"),
-        ]
+        # Retrieve actual environment variables for Windows system/env directories
+        sys_root = os.environ.get("SystemRoot") or os.environ.get("windir")
+        prog_files = os.environ.get("ProgramFiles")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)")
+        user_prof = os.environ.get("USERPROFILE") or os.environ.get("UserProfile")
+        all_user_prof = os.environ.get("ProgramData") or os.environ.get("ALLUSERSPROFILE")
+
+        # Gather all valid paths
+        for raw_path in [sys_root, prog_files, prog_files_x86, user_prof, all_user_prof]:
+            if raw_path:
+                try:
+                    forbidden_directories.append(os.path.abspath(os.path.realpath(raw_path)))
+                except Exception:
+                    pass
+
         # Avoid mounting drive root
         drive, tail = os.path.splitdrive(resolved)
         if not tail or tail.strip(os.sep) == "":
             raise ValueError(f"Mounting drive root is forbidden: {resolved}")
     else:
-        forbidden_prefixes = [
-            "/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/sys", "/proc", "/dev", "/boot"
-        ]
+        # Standard Unix system root and paths
         if resolved == "/":
             raise ValueError("Mounting root directory is forbidden")
 
-    norm_resolved = os.path.normcase(resolved)
-    for p in forbidden_prefixes:
-        if norm_resolved.startswith(p):
+        forbidden_directories = [
+            "/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/sys", "/proc", "/dev", "/boot"
+        ]
+
+    # Enforce component-aware commonpath validation
+    for forbidden_dir in forbidden_directories:
+        if _is_contained_in(forbidden_dir, resolved):
             raise ValueError(f"Mounting system path is forbidden: {resolved}")
 
-    # Check if it looks like SSH, credentials, docker socket, etc.
-    forbidden_keywords = [".ssh", ".aws", ".docker", "docker.sock", "id_rsa"]
-    for kw in forbidden_keywords:
-        if kw in norm_resolved:
+    # Platform-aware component parts check (using pathlib.Path for clean segments)
+    from pathlib import Path
+    parts = Path(resolved).parts
+    parts_lower = [p.lower() for p in parts]
+
+    # 1. Alternate Windows system path roots (Windows only)
+    if os.name == 'nt':
+        # If parts has at least 2 components, verify the first directory level
+        if len(parts_lower) > 1:
+            forbidden_roots = {"windows", "program files", "program files (x86)", "programdata"}
+            if parts_lower[1] in forbidden_roots:
+                raise ValueError(f"System path is forbidden: {resolved}")
+
+    # 2. Block sensitive credential/control folders (e.g. .ssh, .aws, .docker)
+    sensitive_folders = {".ssh", ".aws", ".docker"}
+    for part in parts_lower:
+        if part in sensitive_folders:
+            raise ValueError(f"Mounting sensitive credential/control path is forbidden: {resolved}")
+
+    # 3. Block Docker socket files (e.g. docker.sock)
+    if "docker.sock" in parts_lower:
+        raise ValueError(f"Mounting sensitive credential/control path is forbidden: {resolved}")
+
+    # 4. Block private keys (e.g. id_rsa, id_dsa, id_ecdsa, id_ed25519)
+    if parts_lower:
+        filename = parts_lower[-1]
+        sensitive_files = {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+        if filename in sensitive_files:
             raise ValueError(f"Mounting sensitive credential/control path is forbidden: {resolved}")
 
     return resolved
@@ -808,7 +865,8 @@ class TrueForgeSandboxValidator(SandboxValidator):
     def _execute_local_sandbox(
         self,
         hypothesis: SecurityHypothesis,
-        repository_context: RepositoryReport
+        repository_context: RepositoryReport,
+        runner_path: str
     ) -> ValidationResult:
         """Spawns an isolated Python subprocess sandbox runner to validate codebase."""
         payload = {
@@ -817,7 +875,6 @@ class TrueForgeSandboxValidator(SandboxValidator):
         }
         json_input = json.dumps(payload)
 
-        runner_path = os.path.abspath(os.path.join("src", "breakglass", "validation", "sandbox_runner.py"))
         repo_path = os.path.abspath(repository_context.repository.root)
 
         backend = SubprocessSandboxBackend(self._reader_thread)
@@ -826,7 +883,8 @@ class TrueForgeSandboxValidator(SandboxValidator):
     def _execute_container_sandbox(
         self,
         hypothesis: SecurityHypothesis,
-        repository_context: RepositoryReport
+        repository_context: RepositoryReport,
+        runner_path: str
     ) -> ValidationResult:
         """Spawns an isolated Docker container sandbox runner to validate codebase."""
         payload = {
@@ -837,7 +895,6 @@ class TrueForgeSandboxValidator(SandboxValidator):
         payload["report"]["repository"]["root"] = "/workspace"
         json_input = json.dumps(payload)
 
-        runner_path = os.path.abspath(os.path.join("src", "breakglass", "validation", "sandbox_runner.py"))
         repo_path = os.path.abspath(repository_context.repository.root)
 
         backend = DockerSandboxBackend(self._reader_thread, image_name=self.image_name)
@@ -859,11 +916,36 @@ class TrueForgeSandboxValidator(SandboxValidator):
                 error_message="Sandbox configuration error: Missing TRUEFORGE_API_KEY"
             )
 
+        # 1. Authoritative runner path resolution (CWD-independent)
+        try:
+            import breakglass.validation.sandbox_runner as sandbox_runner
+            runner_path = os.path.abspath(os.path.realpath(sandbox_runner.__file__))
+            if runner_path.endswith('.pyc'):
+                runner_path = runner_path[:-1]
+
+            # Verify file exists and is a regular file
+            if not (os.path.exists(runner_path) and os.path.isfile(runner_path)):
+                return ValidationResult(
+                    hypothesis_id=hypothesis.id,
+                    status=ValidationStatus.PREFLIGHT_ERROR,
+                    attempted=False,
+                    confirmed=False,
+                    error_message=f"Preflight error: Sandbox runner not found at {runner_path}"
+                )
+        except Exception as e:
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.PREFLIGHT_ERROR,
+                attempted=False,
+                confirmed=False,
+                error_message=f"Preflight error: Failed to resolve sandbox runner path: {str(e)}"
+            )
+
         # Dispatch execution
         if self.container_sandbox:
-            return self._execute_container_sandbox(hypothesis, repository_context)
+            return self._execute_container_sandbox(hypothesis, repository_context, runner_path)
         elif self.local_sandbox:
-            return self._execute_local_sandbox(hypothesis, repository_context)
+            return self._execute_local_sandbox(hypothesis, repository_context, runner_path)
 
         # Remote API orchestration mode placeholder:
         return ValidationResult(

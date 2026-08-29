@@ -1398,6 +1398,116 @@ class TestContainerSandboxValidation(unittest.TestCase):
             self.assertEqual(res["status"], "SANDBOX_ERROR")
             self.assertIn("path escape detected", res["error_message"])
 
+    def test_runner_resolution_cwd_independence(self):
+        """Verify runner resolution works independently of caller CWD and handles missing runner."""
+        import breakglass.validation.sandbox_runner as sandbox_runner
+        real_runner_path = os.path.abspath(os.path.realpath(sandbox_runner.__file__))
+        if real_runner_path.endswith('.pyc'):
+            real_runner_path = real_runner_path[:-1]
+
+        self.assertTrue(os.path.isfile(real_runner_path))
+
+        with patch("os.path.isfile") as mock_isfile:
+            mock_isfile.side_effect = lambda path: False if path == real_runner_path else True
+            validator = TrueForgeSandboxValidator(local_sandbox=True)
+            res = validator.validate(self.valid_hyp, self.report)
+            self.assertEqual(res.status, ValidationStatus.PREFLIGHT_ERROR)
+            self.assertIn("Sandbox runner not found", res.error_message)
+
+    @patch("os.path.exists")
+    def test_windows_alternate_drives_mount_validation(self, mock_exists):
+        """Verify Windows alternate drives are rejected case-insensitively, while safe drives/paths are allowed."""
+        from breakglass.validation.validator import _validate_mount_path
+
+        with patch("os.name", "nt"):
+            mock_exists.return_value = True
+
+            with self.assertRaises(ValueError):
+                _validate_mount_path("D:\\Windows")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("D:\\Windows\\System32")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("E:\\Program Files")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("d:\\program files (x86)")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("f:\\programdata")
+
+            with self.assertRaises(ValueError):
+                _validate_mount_path("D:\\wiNdows")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("d:\\PROgram files")
+
+            with patch.dict(os.environ, {
+                "SystemRoot": "C:\\Windows",
+                "ProgramFiles": "C:\\Program Files",
+                "ProgramFiles(x86)": "C:\\Program Files (x86)",
+                "USERPROFILE": "C:\\Users\\testuser",
+                "ProgramData": "C:\\ProgramData"
+            }):
+                allowed_path = _validate_mount_path("D:\\project")
+                self.assertEqual(os.path.normcase(allowed_path), os.path.normcase("D:\\project"))
+
+    @patch("os.path.exists")
+    def test_component_aware_blacklist_validation(self, mock_exists):
+        """Verify component-aware containment logic blocks actual restricted folders but allows similar names."""
+        from breakglass.validation.validator import _validate_mount_path
+        mock_exists.return_value = True
+
+        if os.name != 'nt':
+            with self.assertRaises(ValueError):
+                _validate_mount_path("/etc")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("/etc/passwd")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("/usr")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("/usr/local")
+
+        with self.assertRaises(ValueError):
+            _validate_mount_path("/home/user/.ssh")
+        with self.assertRaises(ValueError):
+            _validate_mount_path("/home/user/.ssh/id_rsa")
+        with self.assertRaises(ValueError):
+            _validate_mount_path("/home/user/.aws/credentials")
+        with self.assertRaises(ValueError):
+            _validate_mount_path("/home/user/.docker/config.json")
+        with self.assertRaises(ValueError):
+            _validate_mount_path("/var/run/docker.sock")
+        with self.assertRaises(ValueError):
+            _validate_mount_path("/workspace/id_rsa")
+
+        if os.name != 'nt':
+            p1 = _validate_mount_path("/etcetera/repo")
+            self.assertEqual(p1, "/etcetera/repo")
+            p2 = _validate_mount_path("/usr-local/project")
+            self.assertEqual(p2, "/usr-local/project")
+
+        p3 = _validate_mount_path("/work/.dockerized-app")
+        self.assertEqual(os.path.normcase(p3), os.path.normcase(os.path.abspath("/work/.dockerized-app")))
+        p4 = _validate_mount_path("/project/id_rsa_backup")
+        self.assertEqual(os.path.normcase(p4), os.path.normcase(os.path.abspath("/project/id_rsa_backup")))
+
+    @patch("os.path.exists")
+    def test_canonicalization_and_traversal_mount_validation(self, mock_exists):
+        """Verify path traversal (..) and spaces in path are handled correctly."""
+        from breakglass.validation.validator import _validate_mount_path
+        mock_exists.return_value = True
+
+        with self.assertRaises(ValueError):
+            _validate_mount_path("/home/user/project/../.ssh")
+
+        with patch.dict(os.environ, {
+            "SystemRoot": "C:\\Windows",
+            "ProgramFiles": "C:\\Program Files",
+            "ProgramFiles(x86)": "C:\\Program Files (x86)",
+            "USERPROFILE": "C:\\Users\\testuser",
+            "ProgramData": "C:\\ProgramData"
+        }):
+            space_path = "/workspace/my project with spaces"
+            res_path = _validate_mount_path(space_path)
+            self.assertTrue(res_path.endswith("my project with spaces"))
+
 
 if __name__ == "__main__":
     unittest.main()
