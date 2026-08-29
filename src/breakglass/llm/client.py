@@ -40,6 +40,13 @@ class GeminiLLMClient(LLMClient):
     """Production LLM client utilizing the Google Gemini API."""
 
     def __init__(self, api_key: Optional[str] = None, model_name: Optional[str] = None):
+        try:
+            import google.generativeai as genai
+        except ImportError:
+            raise ImportError(
+                "The optional 'google-generativeai' package is required for LLM-assisted reasoning. "
+                "Please install the package with the optional LLM extra: pip install \"breakglass[llm]\""
+            )
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not self.api_key:
             raise ValueError(

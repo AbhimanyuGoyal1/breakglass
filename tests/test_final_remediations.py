@@ -389,6 +389,40 @@ class TestGeminiModelConfiguration(unittest.TestCase):
             mock_client_class.assert_called_with(model_name=None)
 
 
+class TestGeminiDependencyContract(unittest.TestCase):
+    """Test suite verifying behavior with and without the optional Gemini dependency (google-generativeai)."""
+
+    def test_default_installation_does_not_require_gemini(self):
+        """Verify that default installation works and runs deterministic reasoning without requiring Gemini import."""
+        with patch.dict(sys.modules, {"google.generativeai": None}):
+            # This simulates a normal lightweight installation where Gemini package is absent.
+            # Instantiating deterministic objects or helper classes should not raise any ImportError.
+            from breakglass.reasoning.engine import DeterministicReasoningEngine
+            engine = DeterministicReasoningEngine()
+            self.assertIsNotNone(engine)
+
+    def test_missing_gemini_extra_produces_actionable_error(self):
+        """Verify that trying to use LLM client without Gemini SDK raises an actionable ImportError."""
+        with patch.dict(sys.modules, {"google.generativeai": None}):
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "dummy_key"}):
+                with self.assertRaises(ImportError) as cm:
+                    GeminiLLMClient()
+                self.assertIn("The optional 'google-generativeai' package is required", str(cm.exception))
+                self.assertIn("pip install \"breakglass[llm]\"", str(cm.exception))
+
+    @patch('breakglass.cli.inspect_repository')
+    @patch('breakglass.cli.DeterministicReasoningEngine')
+    def test_cli_missing_gemini_exits_actionably(self, mock_det, mock_inspect):
+        """Verify that running CLI with --llm when Gemini is missing prints actionable message and exits with 1."""
+        mock_inspect.return_value = MagicMock()
+        mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
+        with patch.dict(sys.modules, {"google.generativeai": None}):
+            with patch('sys.argv', ['breakglass', '.', '--llm']):
+                with self.assertRaises(SystemExit) as cm:
+                    main()
+                self.assertEqual(cm.exception.code, 1)
+
+
 class TestTimeoutPropagation(unittest.TestCase):
     """Test suite verifying CLI and configuration timeouts propagate correctly."""
 

@@ -55,6 +55,31 @@ Controlled Action
 
 ---
 
+## Installation
+
+BREAKGLASS is designed to be lightweight by default, relying on offline deterministic reasoning engines for codebase analysis.
+
+To install BREAKGLASS with the default deterministic analysis capabilities:
+```bash
+pip install -e .
+```
+
+To enable LLM-assisted reasoning using Google Gemini, you must install the optional `llm` extra package dependencies:
+```bash
+pip install -e ".[llm]"
+```
+
+Additionally, to use Gemini-assisted reasoning, you must configure a Gemini API key. Ensure that either the `GEMINI_API_KEY` or `GOOGLE_API_KEY` environment variable is exported:
+```bash
+# On Linux/macOS
+export GEMINI_API_KEY="your-api-key-here"
+
+# On Windows (PowerShell)
+$env:GEMINI_API_KEY="your-api-key-here"
+```
+
+---
+
 ## How to Run Inspection
 
 ### Programmatic Python API
