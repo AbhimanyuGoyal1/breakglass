@@ -1,4 +1,4 @@
-"""Validation Engine and eligibility boundary orchestrator."""
+"""Validation Engine and eligibility boundary orchestrator (Milestone 4A)."""
 
 import concurrent.futures
 from dataclasses import dataclass, field
