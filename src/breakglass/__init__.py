@@ -13,6 +13,7 @@ from breakglass.llm import (
     LLMResponse,
     LLMClient,
     MockLLMClient,
+    GeminiLLMClient,
     LLMReasoningEngine
 )
 from breakglass.validation import (
@@ -48,6 +49,7 @@ __all__ = [
     "LLMResponse",
     "LLMClient",
     "MockLLMClient",
+    "GeminiLLMClient",
     "LLMReasoningEngine",
     "ValidationStatus",
     "ValidationResult",

@@ -9,6 +9,9 @@ description = "Autonomous red-team security assessment agent"
 readme = "README.md"
 requires-python = ">=3.11"
 
+[project.scripts]
+breakglass = "breakglass.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
