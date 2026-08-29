@@ -23,8 +23,8 @@ class ValidationConfig:
 
     def validate(self) -> None:
         """Validates configuration parameters strictly."""
-        if not isinstance(self.timeout_seconds, (int, float)) or self.timeout_seconds <= 0 or isinstance(self.timeout_seconds, bool):
-            raise ValueError("timeout_seconds must be a positive number")
+        if not isinstance(self.timeout_seconds, (int, float)) or isinstance(self.timeout_seconds, bool) or not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be a finite positive number")
         if not isinstance(self.max_output_bytes, int) or self.max_output_bytes <= 0 or isinstance(self.max_output_bytes, bool):
             raise ValueError("max_output_bytes must be a positive integer")
         if not isinstance(self.max_hypotheses_per_run, int) or self.max_hypotheses_per_run <= 0 or isinstance(self.max_hypotheses_per_run, bool):

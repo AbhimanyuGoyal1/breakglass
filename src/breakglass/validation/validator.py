@@ -328,6 +328,8 @@ class SubprocessSandboxBackend(SandboxBackend):
                 except Exception:
                     pass
             proc.wait()
+            t_out.join(timeout=1.0)
+            t_err.join(timeout=1.0)
             try:
                 proc.stdout.close()
                 proc.stderr.close()
@@ -521,6 +523,8 @@ class DockerSandboxBackend(SandboxBackend):
             shutdown_event.set()
             docker_kill_fn()
             proc.wait()
+            t_out.join(timeout=1.0)
+            t_err.join(timeout=1.0)
             try:
                 proc.stdout.close()
                 proc.stderr.close()

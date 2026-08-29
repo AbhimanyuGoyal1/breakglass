@@ -329,7 +329,10 @@ class TestValidationOrchestrator(unittest.TestCase):
     def test_global_timeout_budget_handling(self, m1, m2, m3):
         """Verify orchestrator aborts execution when global budget runs out."""
         def long_hang(hyp, ctx, cancel):
-            time.sleep(2.0)
+            for _ in range(20):
+                if cancel and cancel.is_set():
+                    return ValidationResult(hypothesis_id=hyp.id, status=ValidationStatus.TIMEOUT, attempted=True, confirmed=False)
+                time.sleep(0.1)
             return ValidationResult(hypothesis_id=hyp.id, status=ValidationStatus.VALIDATED, attempted=True, confirmed=True)
 
         for hyp in self.hypotheses:
@@ -766,6 +769,156 @@ class TestValidationOrchestrator(unittest.TestCase):
         self.assertEqual(report.global_status, "SANDBOX_ERROR")
         self.assertEqual(report.results[0]["status"], "SANDBOX_ERROR")
         self.assertIn("iteration failed", report.results[0]["error_message"])
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_malformed_evidence_references_none(self, m1, m2, m3):
+        """Verify that hypothesis with evidence_references=None is safely marked INVALID_HYPOTHESIS without aborting batch."""
+        hyp = SecurityHypothesis(
+            id="HYP-BAD-01",
+            title="Title",
+            description="Desc",
+            category="subprocess",
+            severity="CRITICAL",
+            confidence=0.8,
+            evidence_references=None
+        )
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch([hyp], self.report)
+        self.assertEqual(report.results[0]["status"], "INVALID_HYPOTHESIS")
+        self.assertEqual(report.results[0]["error_message"], "Validation job preflight failed: Hypothesis has no evidence references")
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_malformed_evidence_reference_types(self, m1, m2, m3):
+        """Verify that hypothesis with invalid evidence_reference element types is handled safely."""
+        hyp = SecurityHypothesis(
+            id="HYP-BAD-02",
+            title="Title",
+            description="Desc",
+            category="subprocess",
+            severity="CRITICAL",
+            confidence=0.8,
+            evidence_references=["not-a-ref-obj"]
+        )
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch([hyp], self.report)
+        self.assertEqual(report.results[0]["status"], "INVALID_HYPOTHESIS")
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_malformed_hypothesis_fields(self, m1, m2, m3):
+        """Verify that hypothesis with non-string fields is rejected without aborting batch."""
+        hyp = SecurityHypothesis(
+            id="HYP-BAD-03",
+            title=1234,
+            description="Desc",
+            category="subprocess",
+            severity="CRITICAL",
+            confidence=0.8,
+            evidence_references=[EvidenceReference(type="subprocess", file="main.py", line=10, detail="")]
+        )
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch([hyp], self.report)
+        self.assertEqual(report.results[0]["status"], "INVALID_HYPOTHESIS")
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_malformed_hypothesis_does_not_abort_batch(self, m1, m2, m3):
+        """Verify that subsequent valid hypotheses execute even if prior ones are malformed."""
+        hyp_bad = SecurityHypothesis(
+            id="HYP-BAD-04",
+            title="Title",
+            description="Desc",
+            category="subprocess",
+            severity="CRITICAL",
+            confidence=0.8,
+            evidence_references=None
+        )
+        hyp_good = self.hypotheses[0]
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch([hyp_bad, hyp_good], self.report)
+
+        results_by_id = {r["hypothesis_id"]: r for r in report.results}
+        self.assertEqual(results_by_id["HYP-BAD-04"]["status"], "INVALID_HYPOTHESIS")
+        self.assertEqual(results_by_id[hyp_good.id]["status"], "VALIDATED")
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_global_timeout_budget_handling_accurate_attempted(self, m1, m2, m3):
+        """Verify global timeout cancels running jobs (TIMEOUT/attempted=True) and queued jobs (NOT_ATTEMPTED/attempted=False)."""
+        def long_hang(hyp, ctx, cancel):
+            for _ in range(50):
+                if cancel and cancel.is_set():
+                    return ValidationResult(hypothesis_id=hyp.id, status=ValidationStatus.TIMEOUT, attempted=True, confirmed=False)
+                time.sleep(0.05)
+            return ValidationResult(hypothesis_id=hyp.id, status=ValidationStatus.VALIDATED, attempted=True, confirmed=True)
+
+        for h in self.hypotheses:
+            self.validator.set_behavior(h.id, long_hang)
+
+        config = OrchestratorConfig(max_concurrent_validations=1, global_timeout_budget=0.1)
+        orchestrator = ValidationOrchestrator(self.validator, config)
+        report = orchestrator.validate_batch(self.hypotheses[:3], self.report)
+
+        # The running job was running when global timeout hit, so it was terminated cooperatively
+        running_job = report.results[0]
+        self.assertEqual(running_job["status"], "TIMEOUT")
+        self.assertTrue(running_job["attempted"])
+
+        # The subsequent jobs were in queue, so they are cancelled before start
+        for queued_job in report.results[1:]:
+            self.assertEqual(queued_job["status"], "NOT_ATTEMPTED")
+            self.assertFalse(queued_job["attempted"])
+
+    def test_non_finite_timeout_validation(self):
+        """Verify that non-finite floating-point parameters (NaN, +inf, -inf) and non-positive numbers are rejected."""
+        from breakglass.validation.engine import ValidationConfig
+        for bad_val in (float("nan"), float("inf"), float("-inf"), 0, -10):
+            with self.assertRaises(ValueError):
+                ValidationConfig(timeout_seconds=bad_val).validate()
+
+        for bad_val in (float("nan"), float("inf"), float("-inf"), 0, -10):
+            with self.assertRaises(ValueError):
+                OrchestratorConfig(per_validation_timeout=bad_val).validate()
+            with self.assertRaises(ValueError):
+                OrchestratorConfig(global_timeout_budget=bad_val).validate()
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_malicious_validator_invariants(self, m1, m2, m3):
+        """Verify that contradictory validator outputs (confirmed=True with attempted=False) are fail-closed to SANDBOX_ERROR."""
+        def malicious_output(hyp, ctx, cancel):
+            return ValidationResult(
+                hypothesis_id=hyp.id,
+                status=ValidationStatus.VALIDATED,
+                attempted=False,
+                confirmed=True
+            )
+        self.validator.set_behavior("HYP-LLM-000", malicious_output)
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch([self.hypotheses[0]], self.report)
+        self.assertEqual(report.results[0]["status"], "SANDBOX_ERROR")
+        self.assertFalse(report.results[0]["confirmed"])
+        self.assertTrue(report.results[0]["attempted"])
+
+    def test_double_cleanup_concurrency(self):
+        """Verify backend cleanup functions (docker kill / rm or subprocess kill) are safe from multiple concurrent invocations."""
+        mock_proc = MagicMock()
+        backend = SubprocessSandboxBackend(MagicMock())
+        backend._reader_thread_fn = MagicMock()
+        cancellation_event = threading.Event()
+        cancellation_event.set()
+        with patch("subprocess.Popen", return_value=mock_proc):
+            backend.execute("runner.py", ".", "{}", 10.0, 1024, cancellation_event)
+            backend.execute("runner.py", ".", "{}", 10.0, 1024, cancellation_event)
+            self.assertTrue(mock_proc.kill.called)
 
 
 if __name__ == "__main__":

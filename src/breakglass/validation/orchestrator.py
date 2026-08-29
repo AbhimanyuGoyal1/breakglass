@@ -3,6 +3,7 @@
 import time
 import uuid
 import json
+import math
 import threading
 import concurrent.futures
 from dataclasses import dataclass
@@ -33,10 +34,10 @@ class OrchestratorConfig:
             raise ValueError("max_concurrent_validations must be a positive integer")
         if not isinstance(self.max_total_validations, int) or self.max_total_validations <= 0 or isinstance(self.max_total_validations, bool):
             raise ValueError("max_total_validations must be a positive integer")
-        if not isinstance(self.per_validation_timeout, (int, float)) or self.per_validation_timeout <= 0 or isinstance(self.per_validation_timeout, bool):
-            raise ValueError("per_validation_timeout must be a positive number")
-        if not isinstance(self.global_timeout_budget, (int, float)) or self.global_timeout_budget <= 0 or isinstance(self.global_timeout_budget, bool):
-            raise ValueError("global_timeout_budget must be a positive number")
+        if not isinstance(self.per_validation_timeout, (int, float)) or isinstance(self.per_validation_timeout, bool) or not math.isfinite(self.per_validation_timeout) or self.per_validation_timeout <= 0:
+            raise ValueError("per_validation_timeout must be a finite positive number")
+        if not isinstance(self.global_timeout_budget, (int, float)) or isinstance(self.global_timeout_budget, bool) or not math.isfinite(self.global_timeout_budget) or self.global_timeout_budget <= 0:
+            raise ValueError("global_timeout_budget must be a finite positive number")
         if not isinstance(self.max_aggregate_output_bytes, int) or self.max_aggregate_output_bytes <= 0 or isinstance(self.max_aggregate_output_bytes, bool):
             raise ValueError("max_aggregate_output_bytes must be a positive integer")
         if not isinstance(self.max_queued_jobs, int) or self.max_queued_jobs <= 0 or isinstance(self.max_queued_jobs, bool):
@@ -334,167 +335,169 @@ class ValidationOrchestrator:
             if len(jobs) + len(results_list) >= self.config.max_queued_jobs:
                 break
 
-            # Complete shape & type checks on untrusted input object to prevent crash
-            if not isinstance(hyp, SecurityHypothesis):
-                err_res = ValidationResult(
-                    hypothesis_id="",
-                    status=ValidationStatus.INVALID_HYPOTHESIS,
-                    attempted=False,
-                    confirmed=False,
-                    error_message="Invalid hypothesis shape: Not a SecurityHypothesis instance"
-                )
-                results_list.append(err_res.to_dict())
-                continue
-
-            if not isinstance(hyp.id, str) or not hyp.id.strip():
-                err_res = ValidationResult(
-                    hypothesis_id="",
-                    status=ValidationStatus.INVALID_HYPOTHESIS,
-                    attempted=False,
-                    confirmed=False,
-                    error_message="Invalid hypothesis shape: Empty or non-string ID"
-                )
-                results_list.append(err_res.to_dict())
-                continue
-
-            if hyp.id in seen_hypotheses:
-                continue
-            seen_hypotheses.add(hyp.id)
-
-            if len(jobs) >= self.config.max_total_validations:
-                # We have reached the maximum total validations target, ignore further jobs
-                break
-
-            if not isinstance(hyp.evidence_references, list) or not hyp.evidence_references:
-                err_res = ValidationResult(
-                    hypothesis_id=hyp.id,
-                    status=ValidationStatus.INVALID_HYPOTHESIS,
-                    attempted=False,
-                    confirmed=False,
-                    error_message="Validation job preflight failed: Hypothesis has no evidence references"
-                )
-                results_list.append(err_res.to_dict())
-                continue
-
-            # Strict field shape checking
-            if not isinstance(hyp.title, str) or not isinstance(hyp.description, str) or not isinstance(hyp.category, str):
-                err_res = ValidationResult(
-                    hypothesis_id=hyp.id,
-                    status=ValidationStatus.INVALID_HYPOTHESIS,
-                    attempted=False,
-                    confirmed=False,
-                    error_message="Invalid hypothesis shape: title, description, and category must be strings"
-                )
-                results_list.append(err_res.to_dict())
-                continue
-
-            # 2. Strict ID/Fields/Evidence Authentication (Engine Alignment)
-            # Reconstruct evidence references dynamically to check for fabricated entries
-            canonical_references = []
-            has_invalid_ref = False
-            for ref in hyp.evidence_references:
-                if not isinstance(ref, EvidenceReference):
-                    has_invalid_ref = True
-                    break
-                valid, auth_detail = engine._resolve_and_validate_evidence(ref, report)
-                if not valid:
-                    has_invalid_ref = True
-                    break
-                canonical_references.append(
-                    EvidenceReference(
-                        type=ref.type,
-                        file=ref.file,
-                        line=ref.line,
-                        detail=auth_detail
-                    )
-                )
-
-            if has_invalid_ref:
-                err_res = ValidationResult(
-                    hypothesis_id=hyp.id,
-                    status=ValidationStatus.INVALID_HYPOTHESIS,
-                    attempted=False,
-                    confirmed=False,
-                    error_message="Eligibility check failed: Evidence reference failed to resolve or is fabricated"
-                )
-                results_list.append(err_res.to_dict())
-                continue
-
-            canonical_references.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
-
-            canonical_hyp = SecurityHypothesis(
-                id=hyp.id,
-                title=hyp.title,
-                description=hyp.description,
-                category=hyp.category,
-                severity=hyp.severity,
-                confidence=hyp.confidence,
-                evidence_references=canonical_references,
-                rationale=hyp.rationale
-            )
-
-            # Authenticate ID
-            if not engine._authenticate_hypothesis_id(canonical_hyp, report):
-                err_res = ValidationResult(
-                    hypothesis_id=hyp.id,
-                    status=ValidationStatus.INVALID_HYPOTHESIS,
-                    attempted=False,
-                    confirmed=False,
-                    error_message="Hypothesis authentication failed: ID does not match identity"
-                )
-                results_list.append(err_res.to_dict())
-                continue
-
-            # Check eligibility
-            eligible, reason = engine.check_eligibility(canonical_hyp, report)
-            if not eligible:
-                err_res = ValidationResult(
-                    hypothesis_id=hyp.id,
-                    status=ValidationStatus.INVALID_HYPOTHESIS,
-                    attempted=False,
-                    confirmed=False,
-                    error_message=f"Eligibility check failed: {reason}"
-                )
-                results_list.append(err_res.to_dict())
-                continue
-
-            job_id = str(uuid.uuid4())
-            evidence_refs = [
-                {
-                    "type": r.type,
-                    "file": r.file,
-                    "line": r.line,
-                    "detail": r.detail
-                }
-                for r in canonical_hyp.evidence_references
-            ]
-            job = ValidationJob(
-                job_id=job_id,
-                hypothesis_id=canonical_hyp.id,
-                hypothesis_info={
-                    "category": canonical_hyp.category,
-                    "title": canonical_hyp.title,
-                    "description": canonical_hyp.description,
-                    "rationale": canonical_hyp.rationale
-                },
-                repo_root=report.repository.root,
-                evidence_references=evidence_refs,
-                config={
-                    "timeout_seconds": self.config.per_validation_timeout,
-                    "max_output_bytes": getattr(self.validator, "max_output_bytes", 1024 * 1024),
-                    "max_payload_bytes": getattr(self.validator, "max_payload_bytes", 100 * 1024 * 1024)
-                }
-            )
+            # Exception-isolated per-hypothesis preflight validation
             try:
+                # Complete shape & type checks on untrusted input object to prevent crash
+                if not isinstance(hyp, SecurityHypothesis):
+                    err_res = ValidationResult(
+                        hypothesis_id="",
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message="Invalid hypothesis shape: Not a SecurityHypothesis instance"
+                    )
+                    results_list.append(err_res.to_dict())
+                    continue
+
+                if not hasattr(hyp, "id") or not isinstance(hyp.id, str) or not hyp.id.strip():
+                    err_res = ValidationResult(
+                        hypothesis_id="",
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message="Invalid hypothesis shape: Empty or non-string ID"
+                    )
+                    results_list.append(err_res.to_dict())
+                    continue
+
+                if hyp.id in seen_hypotheses:
+                    continue
+                seen_hypotheses.add(hyp.id)
+
+                if len(jobs) >= self.config.max_total_validations:
+                    # We have reached the maximum total validations target, ignore further jobs
+                    break
+
+                if not hasattr(hyp, "evidence_references") or not isinstance(hyp.evidence_references, list) or not hyp.evidence_references:
+                    err_res = ValidationResult(
+                        hypothesis_id=hyp.id,
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message="Validation job preflight failed: Hypothesis has no evidence references"
+                    )
+                    results_list.append(err_res.to_dict())
+                    continue
+
+                # Strict field shape checking
+                if not hasattr(hyp, "title") or not hasattr(hyp, "description") or not hasattr(hyp, "category") or \
+                   not isinstance(hyp.title, str) or not isinstance(hyp.description, str) or not isinstance(hyp.category, str):
+                    err_res = ValidationResult(
+                        hypothesis_id=hyp.id,
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message="Invalid hypothesis shape: title, description, and category must be strings"
+                    )
+                    results_list.append(err_res.to_dict())
+                    continue
+
+                # 2. Strict ID/Fields/Evidence Authentication (Engine Alignment)
+                # Reconstruct evidence references dynamically to check for fabricated entries
+                canonical_references = []
+                has_invalid_ref = False
+                for ref in hyp.evidence_references:
+                    if not isinstance(ref, EvidenceReference):
+                        has_invalid_ref = True
+                        break
+                    valid, auth_detail = engine._resolve_and_validate_evidence(ref, report)
+                    if not valid:
+                        has_invalid_ref = True
+                        break
+                    canonical_references.append(
+                        EvidenceReference(
+                            type=ref.type,
+                            file=ref.file,
+                            line=ref.line,
+                            detail=auth_detail
+                        )
+                    )
+
+                if has_invalid_ref:
+                    err_res = ValidationResult(
+                        hypothesis_id=hyp.id,
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message="Eligibility check failed: Evidence reference failed to resolve or is fabricated"
+                    )
+                    results_list.append(err_res.to_dict())
+                    continue
+
+                canonical_references.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
+
+                canonical_hyp = SecurityHypothesis(
+                    id=hyp.id,
+                    title=hyp.title,
+                    description=hyp.description,
+                    category=hyp.category,
+                    severity=getattr(hyp, "severity", "CRITICAL") or "CRITICAL",
+                    confidence=float(getattr(hyp, "confidence", 0.8) or 0.8),
+                    evidence_references=canonical_references,
+                    rationale=getattr(hyp, "rationale", "") or ""
+                )
+
+                # Authenticate ID
+                if not engine._authenticate_hypothesis_id(canonical_hyp, report):
+                    err_res = ValidationResult(
+                        hypothesis_id=hyp.id,
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message="Hypothesis authentication failed: ID does not match identity"
+                    )
+                    results_list.append(err_res.to_dict())
+                    continue
+
+                # Check eligibility
+                eligible, reason = engine.check_eligibility(canonical_hyp, report)
+                if not eligible:
+                    err_res = ValidationResult(
+                        hypothesis_id=hyp.id,
+                        status=ValidationStatus.INVALID_HYPOTHESIS,
+                        attempted=False,
+                        confirmed=False,
+                        error_message=f"Eligibility check failed: {reason}"
+                    )
+                    results_list.append(err_res.to_dict())
+                    continue
+
+                job_id = str(uuid.uuid4())
+                evidence_refs = [
+                    {
+                        "type": r.type,
+                        "file": r.file,
+                        "line": r.line,
+                        "detail": r.detail
+                    }
+                    for r in canonical_hyp.evidence_references
+                ]
+                job = ValidationJob(
+                    job_id=job_id,
+                    hypothesis_id=canonical_hyp.id,
+                    hypothesis_info={
+                        "category": canonical_hyp.category,
+                        "title": canonical_hyp.title,
+                        "description": canonical_hyp.description,
+                        "rationale": canonical_hyp.rationale
+                    },
+                    repo_root=report.repository.root,
+                    evidence_references=evidence_refs,
+                    config={
+                        "timeout_seconds": self.config.per_validation_timeout,
+                        "max_output_bytes": getattr(self.validator, "max_output_bytes", 1024 * 1024),
+                        "max_payload_bytes": getattr(self.validator, "max_payload_bytes", 100 * 1024 * 1024)
+                    }
+                )
                 validated_job = ValidationJob.from_dict(job.to_dict())
                 jobs.append(validated_job)
             except Exception as e:
                 err_res = ValidationResult(
-                    hypothesis_id=canonical_hyp.id,
+                    hypothesis_id=getattr(hyp, "id", "") if (hasattr(hyp, "id") and isinstance(hyp.id, str)) else "",
                     status=ValidationStatus.INVALID_HYPOTHESIS,
                     attempted=False,
                     confirmed=False,
-                    error_message=f"Validation job preflight failed: {str(e)}"
+                    error_message=f"Validation preflight encountered unexpected error: {str(e)}"
                 )
                 results_list.append(err_res.to_dict())
 
@@ -580,27 +583,38 @@ class ValidationOrchestrator:
             # Set cancellation event to kill all active runner processes
             batch_cancel.set()
 
-            # Non-blocking shutdown to allow immediate return
-            executor.shutdown(wait=False)
+            # Wait for all executor tasks to complete their cooperative cancellation/teardown
+            executor.shutdown(wait=True)
 
             for fut in pending:
                 job = future_to_job[fut]
-                status_val = ValidationStatus.NOT_ATTEMPTED
-                if global_status == "TIMEOUT":
-                    status_val = ValidationStatus.TIMEOUT
-                elif global_status == "SANDBOX_ERROR":
-                    status_val = ValidationStatus.SANDBOX_ERROR
-
-                err_res = ValidationResult(
-                    hypothesis_id=job.hypothesis_id,
-                    status=status_val,
-                    attempted=False,
-                    confirmed=False,
-                    error_message=f"Validation batch aborted: {global_status}"
-                )
-                results_list.append(err_res.to_dict())
+                try:
+                    res, audit = fut.result()
+                    results_list.append(res.to_dict())
+                    audit_list.append(audit.to_dict())
+                except Exception as e:
+                    err_res = ValidationResult(
+                        hypothesis_id=job.hypothesis_id,
+                        status=ValidationStatus.SANDBOX_ERROR,
+                        attempted=True,
+                        confirmed=False,
+                        error_message=f"Job thread raised exception: {str(e)}"
+                    )
+                    results_list.append(err_res.to_dict())
+                    audit_list.append(
+                        ValidationAuditRecord(
+                            execution_id=str(uuid.uuid4()),
+                            hypothesis_id=job.hypothesis_id,
+                            start_time=loop_start,
+                            end_time=time.perf_counter(),
+                            duration=time.perf_counter() - loop_start,
+                            backend_used="None",
+                            final_status="FAILED",
+                            termination_reason=str(e)
+                        ).to_dict()
+                    )
         else:
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=True)
 
         if batch_cancel.is_set() and global_status == "SUCCESS":
             global_status = "CANCELLED"
