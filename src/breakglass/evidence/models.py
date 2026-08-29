@@ -3,6 +3,24 @@ import json
 import math
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List
+from types import MappingProxyType
+
+def freeze_dict(d: Any) -> Any:
+    """Recursively freeze dicts to MappingProxyType and lists to tuples to prevent mutations."""
+    if isinstance(d, dict):
+        frozen_copy = {k: freeze_dict(v) for k, v in d.items()}
+        return MappingProxyType(frozen_copy)
+    elif isinstance(d, list):
+        return tuple(freeze_dict(x) for x in d)
+    return d
+
+def unfreeze_dict(d: Any) -> Any:
+    """Recursively unfreeze MappingProxyType/tuples back to standard dicts and lists."""
+    if isinstance(d, (MappingProxyType, dict)):
+        return {k: unfreeze_dict(v) for k, v in d.items()}
+    elif isinstance(d, (list, tuple)):
+        return [unfreeze_dict(x) for x in d]
+    return d
 
 def generate_evidence_id(kind: str, identity: Dict[str, Any]) -> str:
     """Generates a stable, collision-resistant evidence ID using SHA-256."""
@@ -51,6 +69,10 @@ class EvidenceNode:
         fp = hashlib.sha256(self.content.encode("utf-8")).hexdigest()
         object.__setattr__(self, "fingerprint", fp)
 
+        # Defensively copy and recursively freeze provenance_metadata
+        frozen_meta = freeze_dict(self.provenance_metadata)
+        object.__setattr__(self, "provenance_metadata", frozen_meta)
+
         # Reconstruct identity dictionary for stable hashing
         identity = {
             "kind": self.kind,
@@ -73,7 +95,7 @@ class EvidenceNode:
             "source": self.source,
             "confidence": self.confidence,
             "fingerprint": self.fingerprint,
-            "provenance_metadata": self.provenance_metadata
+            "provenance_metadata": unfreeze_dict(self.provenance_metadata)
         }
 
 
@@ -148,6 +170,11 @@ class EvidenceGraph:
 
     def add_node(self, node: EvidenceNode) -> str:
         """Adds a node if it fits the configured resource budget, deduplicating on ID."""
+        # 1. Deduplicate first before capacity checks
+        if node.id in self.nodes:
+            return node.id
+
+        # 2. Check capacity limits for new nodes
         if len(self.nodes) >= self.config.max_nodes:
             raise ValueError(f"Max nodes limit of {self.config.max_nodes} exceeded")
         
@@ -155,21 +182,46 @@ class EvidenceGraph:
         if self.total_evidence_bytes + node_bytes > self.config.max_total_evidence_bytes:
             raise ValueError(f"Max total evidence bytes limit of {self.config.max_total_evidence_bytes} exceeded")
 
-        if node.id in self.nodes:
-            return node.id
-
         self.nodes[node.id] = node
         self.total_evidence_bytes += node_bytes
         return node.id
 
     def add_edge(self, edge: EvidenceEdge) -> None:
         """Adds a relationship edge, deduplicating on ID connections and edge type."""
+        # 1. Deduplicate first
+        duplicate = any(e.source_id == edge.source_id and e.target_id == edge.target_id and e.type == edge.type for e in self.edges)
+        if duplicate:
+            return
+
+        # 2. Enforce limits for new edges
         if len(self.edges) >= self.config.max_edges:
             raise ValueError(f"Max edges limit of {self.config.max_edges} exceeded")
-        
-        duplicate = any(e.source_id == edge.source_id and e.target_id == edge.target_id and e.type == edge.type for e in self.edges)
-        if not duplicate:
-            self.edges.append(edge)
+
+        # 3. Enforce provenance depth (longest simple path) limit
+        temp_edges = self.edges + [edge]
+        adj = {}
+        for e in temp_edges:
+            adj.setdefault(e.source_id, []).append(e.target_id)
+            
+        def dfs(node, path_set):
+            if node in path_set:
+                return 0
+            path_set.add(node)
+            max_depth = 1
+            for neighbor in adj.get(node, []):
+                max_depth = max(max_depth, 1 + dfs(neighbor, path_set.copy()))
+            return max_depth
+
+        all_nodes = set()
+        for e in temp_edges:
+            all_nodes.add(e.source_id)
+            all_nodes.add(e.target_id)
+            
+        for n in all_nodes:
+            if dfs(n, set()) > self.config.max_provenance_depth:
+                raise ValueError(f"Max provenance depth of {self.config.max_provenance_depth} exceeded")
+
+        self.edges.append(edge)
 
     def to_dict(self) -> Dict[str, Any]:
         """Provides sorted dictionary representation for deterministic ordering."""

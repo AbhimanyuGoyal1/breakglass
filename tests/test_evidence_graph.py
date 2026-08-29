@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 from typing import Dict, Any
 
+from unittest.mock import MagicMock
 from breakglass.inspection.models import RepositoryReport, RepositorySummary, SecurityIndicator, RouteCandidate, EntryPointCandidate
 from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference
 from breakglass.evidence.models import EvidenceNode, EvidenceEdge, EvidenceGraph, EvidenceGraphConfig, generate_evidence_id
@@ -308,3 +309,176 @@ class TestEvidenceGraph(unittest.TestCase):
         valid, canonical_hyp, err_msg = engine.validate_hypothesis_shape(hyp, report)
         self.assertTrue(valid, f"Validation failed: {err_msg}")
         self.assertEqual(canonical_hyp.id, hyp.id)
+
+    # --- 7. Qodo Remediation Regression Tests ---
+    def test_qodo_finding_1_fingerprint_verification(self):
+        """Verify that fingerprint mismatch prevents stale/mutated evidence reference authentication."""
+        report = RepositoryReport(
+            repository=RepositorySummary(root=self.repo_root, total_files=1, total_directories=0, config_files=[self.dummy_file]),
+            security_indicators=[SecurityIndicator(category="secret_config", indicator_type="api", file=self.dummy_file, line=10, evidence="API_KEY=[REDACTED]")],
+            routes=[], entry_points=[], manifests=[], errors=[]
+        )
+        # Correct detail and fingerprint (hash of canonical detail)
+        ref_ok = EvidenceReference(
+            type="security_indicator", file=self.dummy_file, line=10,
+            detail="Exposed secret config: API_KEY=[REDACTED]"
+        )
+        valid, _ = authenticate_evidence_reference(ref_ok, report, self.repo_root)
+        self.assertTrue(valid)
+
+        # Mutated detail and matching fingerprint of mutated detail (should fail fingerprint verification against canonical)
+        ref_mutated = EvidenceReference(
+            type="security_indicator", file=self.dummy_file, line=10,
+            detail="Exposed secret config: API_KEY=mutated_secret"
+        )
+        valid, _ = authenticate_evidence_reference(ref_mutated, report, self.repo_root)
+        self.assertFalse(valid)
+
+    def test_qodo_finding_3_same_coordinate_conflation(self):
+        """Verify that two distinct findings at the same file/line do not conflate and resolve to correct nodes."""
+        report = RepositoryReport(
+            repository=RepositorySummary(root=self.repo_root, total_files=1, total_directories=0, config_files=[self.dummy_file]),
+            security_indicators=[
+                SecurityIndicator(category="subprocess", indicator_type="sub", file=self.dummy_file, line=15, evidence="subprocess.run"),
+                SecurityIndicator(category="database", indicator_type="db", file=self.dummy_file, line=15, evidence="SELECT 1")
+            ],
+            routes=[], entry_points=[], manifests=[], errors=[]
+        )
+        hyp = SecurityHypothesis(
+            id="HYP-1", title="T", description="D", category="command_injection", severity="HIGH", confidence=0.8,
+            evidence_references=[
+                EvidenceReference(type="security_indicator", file=self.dummy_file, line=15, detail="Subprocess call: subprocess.run"),
+                EvidenceReference(type="security_indicator", file=self.dummy_file, line=15, detail="Database indicator: SELECT 1")
+            ]
+        )
+        builder = EvidenceGraphBuilder(self.config)
+        graph = builder.build_graph(report, [hyp], self.repo_root)
+
+        # Should produce two distinct nodes for the indicators instead of overwriting/conflating
+        indicator_nodes = [n for n in graph.nodes.values() if n.kind == "security_indicator"]
+        self.assertEqual(len(indicator_nodes), 2)
+        contents = {n.content for n in indicator_nodes}
+        self.assertIn("subprocess.run", contents)
+        self.assertIn("SELECT 1", contents)
+
+    def test_qodo_finding_4_deduplication_at_capacity(self):
+        """Verify duplicate nodes and edges can be added successfully even at capacity limit."""
+        cfg = EvidenceGraphConfig(max_nodes=1, max_edges=1, max_total_evidence_bytes=1000)
+        graph = EvidenceGraph(cfg)
+
+        node = EvidenceNode(kind="file", path=self.dummy_file, content="abc", source="repo", confidence=0.9)
+        id1 = graph.add_node(node)
+        
+        # Second add of the duplicate node should succeed without raising capacity limit error
+        id2 = graph.add_node(node)
+        self.assertEqual(id1, id2)
+
+        edge = EvidenceEdge(source_id="A", target_id="B", type="evidence_to_hypothesis")
+        graph.add_edge(edge)
+
+        # Second add of the duplicate edge should succeed/noop without capacity limit error
+        graph.add_edge(edge)
+        self.assertEqual(len(graph.edges), 1)
+
+    def test_qodo_finding_5_boolean_confidence_rejection(self):
+        """Verify that Python boolean True/False values are strictly rejected for confidence."""
+        with self.assertRaises(ValueError):
+            EvidenceNode(kind="file", path=self.dummy_file, content="", source="repo", confidence=True)
+
+        with self.assertRaises(ValueError):
+            EvidenceNode(kind="file", path=self.dummy_file, content="", source="repo", confidence=False)
+
+    def test_qodo_finding_6_frozen_metadata_immutability(self):
+        """Verify that provenance metadata is defensively copied and frozen during construction and to_dict()."""
+        meta = {"nested": {"key": "val"}}
+        node = EvidenceNode(
+            kind="file", path=self.dummy_file, content="", source="repo", confidence=1.0,
+            provenance_metadata=meta
+        )
+        
+        # Original input modification does not affect node
+        meta["nested"]["key"] = "hacked"
+        self.assertEqual(node.provenance_metadata["nested"]["key"], "val")
+
+        # Mutating frozen node metadata dictionary should raise TypeError
+        with self.assertRaises(TypeError):
+            node.provenance_metadata["nested"]["key"] = "hacked"
+
+        # to_dict() returns a detached mutable dict that doesn't mutate node internals
+        d = node.to_dict()
+        d["provenance_metadata"]["nested"]["key"] = "hacked"
+        self.assertEqual(node.provenance_metadata["nested"]["key"], "val")
+
+    def test_qodo_finding_7_provenance_depth_limit(self):
+        """Verify that adding edges exceeding max_provenance_depth is rejected."""
+        cfg = EvidenceGraphConfig(max_provenance_depth=3)
+        graph = EvidenceGraph(cfg)
+
+        # Path of length 3 nodes (2 edges): A -> B -> C
+        graph.add_edge(EvidenceEdge(source_id="A", target_id="B", type="evidence_to_related_evidence"))
+        graph.add_edge(EvidenceEdge(source_id="B", target_id="C", type="evidence_to_related_evidence"))
+
+        # Adding 3rd edge (making length 4 nodes): C -> D should fail
+        with self.assertRaises(ValueError):
+            graph.add_edge(EvidenceEdge(source_id="C", target_id="D", type="evidence_to_related_evidence"))
+
+    def test_qodo_finding_8_graph_references_untrusted_bypass(self):
+        """Verify that forged details or unreported files in evidence references fail to create graph nodes/edges."""
+        report = RepositoryReport(
+            repository=RepositorySummary(root=self.repo_root, total_files=1, total_directories=0, config_files=[self.dummy_file]),
+            security_indicators=[], routes=[], entry_points=[], manifests=[], errors=[]
+        )
+        hyp = SecurityHypothesis(
+            id="HYP-1", title="T", description="D", category="insecure_config", severity="LOW", confidence=0.8,
+            evidence_references=[
+                # Untrusted/unreported file
+                EvidenceReference(type="file", file="src/unreported.py", line=None, detail="File: src/unreported.py"),
+                # Forged detail security indicator
+                EvidenceReference(type="security_indicator", file=self.dummy_file, line=10, detail="Exposed secret config: FORGED")
+            ]
+        )
+        builder = EvidenceGraphBuilder(self.config)
+        graph = builder.build_graph(report, [hyp], self.repo_root)
+
+        # Graph should not contain any of the unauthenticated nodes/edges
+        self.assertEqual(len(graph.nodes), 0)
+        self.assertEqual(len(graph.edges), 0)
+
+    def test_qodo_finding_9_manifest_file_provenance(self):
+        """Verify manifest files are successfully authenticated as valid file references."""
+        report = RepositoryReport(
+            repository=RepositorySummary(root=self.repo_root, total_files=1, total_directories=0, config_files=[]),
+            security_indicators=[], routes=[], entry_points=[],
+            manifests=[MagicMock(file="package.json", ecosystem="npm", dependencies=[])],
+            errors=[]
+        )
+        ref = EvidenceReference(type="file", file="package.json", line=None, detail="File: package.json")
+        valid, canonical = authenticate_evidence_reference(ref, report, self.repo_root)
+        self.assertTrue(valid)
+        self.assertEqual(canonical, "File: package.json")
+
+    def test_qodo_finding_10_bytesafe_utf8_truncation(self):
+        """Verify genuinely byte-safe UTF-8 snippet truncation that preserves multibyte characters."""
+        # € is 3 bytes in UTF-8. 
+        # "a€b" is 1 + 3 + 1 = 5 bytes.
+        text = "a\u20acb" # "a€b"
+        
+        # Truncate at 2 bytes: should drop partial € and return "a"
+        cfg2 = EvidenceGraphConfig(max_evidence_snippet_bytes=2)
+        builder = EvidenceGraphBuilder(cfg2)
+        report = RepositoryReport(
+            repository=RepositorySummary(root=self.repo_root, total_files=1, total_directories=0, config_files=[self.dummy_file]),
+            security_indicators=[SecurityIndicator(category="subprocess", indicator_type="sub", file=self.dummy_file, line=1, evidence=text)],
+            routes=[], entry_points=[], manifests=[], errors=[]
+        )
+        graph = builder.build_graph(report, [], self.repo_root)
+        node = list(graph.nodes.values())[0]
+        self.assertEqual(node.content, "a")
+
+        # Truncate at 4 bytes: should keep € (3 bytes) + "a" (1 byte) -> "a€"
+        cfg4 = EvidenceGraphConfig(max_evidence_snippet_bytes=4)
+        builder4 = EvidenceGraphBuilder(cfg4)
+        graph4 = builder4.build_graph(report, [], self.repo_root)
+        node4 = list(graph4.nodes.values())[0]
+        self.assertEqual(node4.content, "a\u20ac")
+

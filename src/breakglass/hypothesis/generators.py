@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Optional
 from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference, generate_hypothesis_id
 from breakglass.inspection.scanner import _is_contained_in
 from breakglass.inspection.models import RepositoryReport
+from breakglass.inspection.indicators import redact_secrets
 
 def validate_and_create_evidence_ref(
     ref_type: str,
@@ -258,7 +259,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                             "indicator_type": ind.indicator_type,
                             "file": ind.file,
                             "line": ind.line,
-                            "evidence": ind.evidence
+                            "evidence": redact_secrets(ind.evidence)
                         },
                         "route": {
                             "file": route.file,
@@ -316,7 +317,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                             "indicator_type": ind.indicator_type,
                             "file": ind.file,
                             "line": ind.line,
-                            "evidence": ind.evidence
+                            "evidence": redact_secrets(ind.evidence)
                         },
                         "route": {
                             "file": route.file,
@@ -371,7 +372,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                             "indicator_type": ind.indicator_type,
                             "file": ind.file,
                             "line": ind.line,
-                            "evidence": ind.evidence
+                            "evidence": redact_secrets(ind.evidence)
                         },
                         "entry_point": {
                             "file": ep.file,
@@ -421,7 +422,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                     "indicator_type": ind.indicator_type,
                     "file": ind.file,
                     "line": ind.line,
-                    "evidence": ind.evidence
+                    "evidence": redact_secrets(ind.evidence)
                 },
                 "frameworks": sorted_frameworks
             }
@@ -453,7 +454,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                     "security_indicator", ind.file, ind.line, f"Exposed secret config: {ind.evidence}", repo_root, report
                 )
                 if ref:
-                    identity = {"rule": "ind_secret", "file": ind.file, "line": ind.line, "evidence": ind.evidence}
+                    identity = {"rule": "ind_secret", "file": ind.file, "line": ind.line, "evidence": redact_secrets(ind.evidence)}
                     hyp_id = generate_hypothesis_id("credential_exposure", identity, is_llm=False)
                     candidates.append(SecurityHypothesis(
                         id=hyp_id,
@@ -477,7 +478,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                     "security_indicator", ind.file, ind.line, f"Access control: {ind.evidence}", repo_root, report
                 )
                 if ref:
-                    identity = {"rule": "ind_auth", "file": ind.file, "line": ind.line, "evidence": ind.evidence}
+                    identity = {"rule": "ind_auth", "file": ind.file, "line": ind.line, "evidence": redact_secrets(ind.evidence)}
                     hyp_id = generate_hypothesis_id("insecure_auth", identity, is_llm=False)
                     candidates.append(SecurityHypothesis(
                         id=hyp_id,
@@ -501,7 +502,7 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
                     "security_indicator", ind.file, ind.line, f"Filesystem access: {ind.evidence}", repo_root, report
                 )
                 if ref:
-                    identity = {"rule": "ind_file", "file": ind.file, "line": ind.line, "evidence": ind.evidence}
+                    identity = {"rule": "ind_file", "file": ind.file, "line": ind.line, "evidence": redact_secrets(ind.evidence)}
                     hyp_id = generate_hypothesis_id("path_traversal", identity, is_llm=False)
                     candidates.append(SecurityHypothesis(
                         id=hyp_id,

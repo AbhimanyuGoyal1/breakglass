@@ -11,6 +11,7 @@ from breakglass.inspection.models import RepositoryReport
 from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference, generate_hypothesis_id
 from breakglass.validation.models import ValidationResult, ValidationStatus
 from breakglass.validation.validator import SandboxValidator
+from breakglass.inspection.indicators import redact_secrets
 
 
 @dataclass
@@ -173,34 +174,6 @@ class ValidationEngine:
         canonical_str = json.dumps(request_data, sort_keys=True, separators=(",", ":"))
         return len(canonical_str.encode("utf-8"))
 
-    def _match_indicator_detail(self, ind: Any, detail: str) -> bool:
-        """Checks if a SecurityIndicator matches the specified detail string pattern."""
-        if ind.category == "subprocess":
-            return detail in (f"Subprocess call: {ind.evidence}", f"Security indicator: {ind.evidence}")
-        elif ind.category == "database":
-            return detail in (f"Database indicator: {ind.evidence}", f"Security indicator: {ind.evidence}")
-        elif ind.category == "serialization":
-            return detail in (f"Serialization call: {ind.evidence}", f"Security indicator: {ind.evidence}")
-        elif ind.category in ("cloud_sdk", "secret_config"):
-            return detail in (
-                f"Cloud/Secrets indicator: {ind.evidence}",
-                f"Exposed secret configuration reference: {ind.evidence}",
-                f"Exposed secret config: {ind.evidence}",
-                f"Security indicator: {ind.evidence}"
-            )
-        elif ind.category in ("authentication", "authorization"):
-            return detail in (
-                f"Access control: {ind.evidence}",
-                f"Security indicator: {ind.evidence}"
-            )
-        elif ind.category == "filesystem":
-            return detail in (
-                f"Filesystem access: {ind.evidence}",
-                f"Security indicator: {ind.evidence}"
-            )
-        else:
-            return detail == f"Security indicator: {ind.evidence}"
-
     def _resolve_and_validate_evidence(self, ref: EvidenceReference, report: RepositoryReport) -> Tuple[bool, str]:
         """Resolves untrusted evidence reference against authoritative report findings."""
         from breakglass.evidence.auth import authenticate_evidence_reference
@@ -223,7 +196,8 @@ class ValidationEngine:
                     type=ref.type,
                     file=ref.file,
                     line=ref.line,
-                    detail=auth_detail
+                    detail=auth_detail,
+                    fingerprint=hashlib.sha256(auth_detail.encode("utf-8")).hexdigest()
                 )
             )
         # Sort references deterministically
@@ -255,13 +229,19 @@ class ValidationEngine:
             ind_ref = next((r for r in canonical_references if r.type == "security_indicator"), None)
             ind = None
             if ind_ref:
-                # Find all indicators matching file, line, and the detail pattern
-                matching_inds = [
-                    i for i in report.security_indicators
-                    if i.file == ind_ref.file
-                    and (i.line == ind_ref.line or (i.line is None and ind_ref.line is None))
-                    and self._match_indicator_detail(i, ind_ref.detail)
-                ]
+                # Find all indicators matching file, line, and the detail pattern using canonical detail matcher (Finding 2)
+                matching_inds = []
+                for i in getattr(report, "security_indicators", []) or []:
+                    if i is None:
+                        continue
+                    i_file = getattr(i, "file", None)
+                    i_line = getattr(i, "line", None)
+                    if i_file and i_file.replace("\\", "/") == ind_ref.file.replace("\\", "/"):
+                        if i_line == ind_ref.line or (i_line is None and ind_ref.line is None):
+                            from breakglass.evidence.auth import _match_indicator_detail
+                            if _match_indicator_detail(i, ind_ref.detail):
+                                matching_inds.append(i)
+
                 if len(matching_inds) == 1:
                     ind = matching_inds[0]
                 elif len(matching_inds) > 1:
@@ -282,7 +262,7 @@ class ValidationEngine:
                         "indicator_type": ind.indicator_type,
                         "file": ind.file,
                         "line": ind.line,
-                        "evidence": ind.evidence
+                        "evidence": redact_secrets(ind.evidence)
                     },
                     "route": {
                         "file": route.file,
@@ -306,7 +286,7 @@ class ValidationEngine:
                         "indicator_type": ind.indicator_type,
                         "file": ind.file,
                         "line": ind.line,
-                        "evidence": ind.evidence
+                        "evidence": redact_secrets(ind.evidence)
                     },
                     "route": {
                         "file": route.file,
@@ -330,7 +310,7 @@ class ValidationEngine:
                         "indicator_type": ind.indicator_type,
                         "file": ind.file,
                         "line": ind.line,
-                        "evidence": ind.evidence
+                        "evidence": redact_secrets(ind.evidence)
                     },
                     "entry_point": {
                         "file": ep.file,
@@ -350,7 +330,7 @@ class ValidationEngine:
                         "indicator_type": ind.indicator_type,
                         "file": ind.file,
                         "line": ind.line,
-                        "evidence": ind.evidence
+                        "evidence": redact_secrets(ind.evidence)
                     },
                     "frameworks": sorted_frameworks
                 }
@@ -358,7 +338,7 @@ class ValidationEngine:
                     "rule": "ind_secret",
                     "file": ind.file,
                     "line": ind.line,
-                    "evidence": ind.evidence
+                    "evidence": redact_secrets(ind.evidence)
                 }
                 id_corr = generate_hypothesis_id(hypothesis.category, identity_correlation, is_llm=False)
                 id_stan = generate_hypothesis_id(hypothesis.category, identity_standalone, is_llm=False)
@@ -375,7 +355,7 @@ class ValidationEngine:
                     "rule": "ind_auth",
                     "file": ind.file,
                     "line": ind.line,
-                    "evidence": ind.evidence
+                    "evidence": redact_secrets(ind.evidence)
                 }
             elif hypothesis.category == "path_traversal":
                 if not ind:
@@ -384,7 +364,7 @@ class ValidationEngine:
                     "rule": "ind_file",
                     "file": ind.file,
                     "line": ind.line,
-                    "evidence": ind.evidence
+                    "evidence": redact_secrets(ind.evidence)
                 }
             elif hypothesis.category == "insecure_dependency":
                 file_ref = next((r for r in canonical_references if r.type == "file"), None)
