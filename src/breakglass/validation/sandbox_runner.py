@@ -37,22 +37,47 @@ def check_file_evidence_streaming(
         if line_idx <= 0:
             return False, f"Invalid line index: {line_idx}"
 
-        # Line-based search: iterate lines, check total byte size
+        # Chunked line-based search: avoid loading extremely long lines into memory at once
+        chunk_size = 64 * 1024
+        current_line = 1
+        line_buffer = bytearray()
         try:
             with open(resolved_path, "rb") as f:
-                current_line = 0
-                for line in f:
-                    total_bytes += len(line)
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    total_bytes += len(chunk)
                     if total_bytes > max_bytes:
                         return False, f"File size exceeded the {max_bytes} bytes limit"
-                    current_line += 1
-                    if current_line == line_idx:
-                        # Decode target line
-                        line_str = line.decode("utf-8", errors="replace")
-                        if evidence_str in line_str:
-                            return True, f"Found evidence '{evidence_str}' at line {line_idx}"
-                        return False, f"Evidence '{evidence_str}' not found in line {line_idx} content"
-                return False, f"File has only {current_line} lines, line {line_idx} does not exist"
+
+                    start = 0
+                    while True:
+                        idx = chunk.find(b"\n", start)
+                        if idx == -1:
+                            line_buffer.extend(chunk[start:])
+                            if len(line_buffer) > max_bytes:
+                                return False, f"Line length exceeded the {max_bytes} bytes limit"
+                            break
+
+                        line_buffer.extend(chunk[start:idx + 1])
+                        if current_line == line_idx:
+                            line_str = line_buffer.decode("utf-8", errors="replace")
+                            if evidence_str in line_str:
+                                return True, f"Found evidence '{evidence_str}' at line {line_idx}"
+                            return False, f"Evidence '{evidence_str}' not found in line {line_idx} content"
+
+                        current_line += 1
+                        line_buffer.clear()
+                        start = idx + 1
+
+                if line_buffer and current_line == line_idx:
+                    line_str = line_buffer.decode("utf-8", errors="replace")
+                    if evidence_str in line_str:
+                        return True, f"Found evidence '{evidence_str}' at line {line_idx}"
+                    return False, f"Evidence '{evidence_str}' not found in line {line_idx} content"
+
+            return False, f"File has only {current_line - 1} lines, line {line_idx} does not exist"
         except Exception as e:
             return False, f"Error reading file line: {str(e)}"
     else:
@@ -182,10 +207,11 @@ def run_validation(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             # Enforce sandbox boundary containment to reject path traversal and symlink escapes
             # Normalize with trailing slash to prevent suffix containment bypass (e.g. /workspace-backup vs /workspace)
-            sandbox_root_norm = os.path.join(sandbox_root_abs, "")
-            resolved_path_norm = os.path.join(resolved_path, "")
+            sandbox_root_norm = os.path.normcase(os.path.join(sandbox_root_abs, ""))
+            resolved_path_norm = os.path.normcase(resolved_path)
+            sandbox_root_abs_norm = os.path.normcase(sandbox_root_abs)
 
-            if not (resolved_path.startswith(sandbox_root_norm) or resolved_path == sandbox_root_abs):
+            if not (resolved_path_norm.startswith(sandbox_root_norm) or resolved_path_norm == sandbox_root_abs_norm):
                 return {
                     "hypothesis_id": hyp_id,
                     "status": "SANDBOX_ERROR",

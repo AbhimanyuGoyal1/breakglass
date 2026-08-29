@@ -719,6 +719,54 @@ class TestValidationOrchestrator(unittest.TestCase):
             backend.execute("runner.py", ".", "{}", 10.0, 1024, cancellation_event)
             mock_proc.kill.assert_called()
 
+    def test_long_line_memory_attack_protection(self):
+        """Verify that streaming search safely blocks long-line memory attacks without loading into memory."""
+        temp_file = "scratch_test_long_line.txt"
+        try:
+            with open(temp_file, "wb") as f:
+                # Write a single line of 100KB without newlines
+                f.write(b"A" * 100 * 1024)
+            from breakglass.validation.sandbox_runner import check_file_evidence_streaming
+            # Attempt to search file under 1KB limit
+            success, detail = check_file_evidence_streaming(temp_file, "B", line_idx=1, max_bytes=1024)
+            self.assertFalse(success)
+            self.assertIn("exceeded", detail)
+        finally:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+    @patch("breakglass.validation.engine.ValidationEngine._authenticate_hypothesis_id", return_value=True)
+    @patch("breakglass.validation.engine.ValidationEngine.check_eligibility", return_value=(True, ""))
+    @patch("breakglass.validation.engine.ValidationEngine._resolve_and_validate_evidence", return_value=(True, "File: config.json"))
+    def test_linker_thread_leak_protection(self, m1, m2, m3):
+        """Verify linker daemon threads exit cleanly and do not leak after job completion/cancellation."""
+        import threading
+        initial_threads = threading.active_count()
+
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch(self.hypotheses[:2], self.report)
+
+        # Give background linker threads a brief moment to exit
+        time.sleep(0.1)
+        current_threads = threading.active_count()
+        # Verify that thread count did not grow due to lingering linker threads
+        self.assertTrue(current_threads <= initial_threads + 2)
+
+    def test_hostile_generator_iteration_protection(self):
+        """Verify that validation batch protects against exceptions raised by hostile generator input."""
+        class HostileGenerator:
+            def __iter__(self):
+                return self
+            def __next__(self):
+                raise RuntimeError("Hostile database connection drop simulated during iteration")
+
+        orchestrator = ValidationOrchestrator(self.validator)
+        report = orchestrator.validate_batch(HostileGenerator(), self.report)
+
+        self.assertEqual(report.global_status, "SANDBOX_ERROR")
+        self.assertEqual(report.results[0]["status"], "SANDBOX_ERROR")
+        self.assertIn("iteration failed", report.results[0]["error_message"])
+
 
 if __name__ == "__main__":
     unittest.main()

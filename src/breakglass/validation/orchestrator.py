@@ -216,7 +216,11 @@ class ValidationOrchestrator:
             finally:
                 job_executor.shutdown(wait=False)
 
-            # Prevent memory bloat from a compromised validator returning huge strings
+            # Run validator output through canonical ValidationEngine result integrity checks
+            from breakglass.validation.engine import ValidationEngine
+            engine = ValidationEngine(self.validator)
+            res = engine._validate_result_integrity(res, job.hypothesis_id)
+
             # Enforce strict field size truncation limits on the host side
             if len((res.stdout or "").encode("utf-8")) > 100 * 1024:
                 res.stdout = res.stdout[:100 * 1024] + "... [TRUNCATED]"
@@ -279,7 +283,10 @@ class ValidationOrchestrator:
             audit.final_status = JobState.SANDBOX_ERROR.value
             audit.termination_reason = res.error_message
 
-        return res, audit
+        try:
+            return res, audit
+        finally:
+            job_cancel.set()
 
     def validate_batch(
         self,
@@ -304,7 +311,25 @@ class ValidationOrchestrator:
         engine = ValidationEngine(self.validator)
 
         # 1. Bounded admission loop iterating over generator/iterable on-demand
-        for hyp in hypotheses:
+        iterator = iter(hypotheses)
+        while True:
+            try:
+                hyp = next(iterator)
+            except StopIteration:
+                break
+            except Exception as e:
+                global_status = "SANDBOX_ERROR"
+                batch_cancel.set()
+                err_res = ValidationResult(
+                    hypothesis_id="",
+                    status=ValidationStatus.SANDBOX_ERROR,
+                    attempted=False,
+                    confirmed=False,
+                    error_message=f"Hypothesis iteration failed: {str(e)}"
+                )
+                results_list.append(err_res.to_dict())
+                break
+
             # Stop once the total jobs + preflight failures satisfy max_queued_jobs limit
             if len(jobs) + len(results_list) >= self.config.max_queued_jobs:
                 break
