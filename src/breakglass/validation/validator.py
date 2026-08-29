@@ -9,6 +9,7 @@ import time
 import math
 import threading
 import queue
+import uuid
 from typing import Dict, Any, Optional, Tuple
 from breakglass.inspection.models import RepositoryReport
 from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference
@@ -80,6 +81,405 @@ class _CombinedOutputCounter:
             return self._value
 
 
+def _validate_mount_path(path: str) -> str:
+    """Validates and canonicalizes a path for mounting or sandboxed validation.
+
+    Rejects paths that escape, UNC paths, and forbidden host roots/system dirs.
+    """
+    if not path:
+        raise ValueError("Mount path is empty")
+
+    # Canonicalize path (resolve symlinks, relative path segments, and drives)
+    resolved = os.path.abspath(os.path.realpath(path))
+
+    # Check existence
+    if not os.path.exists(resolved):
+        raise ValueError(f"Mount path does not exist: {resolved}")
+
+    # Check if UNC path on Windows
+    if os.name == 'nt' and resolved.startswith('\\\\'):
+        raise ValueError(f"UNC paths are not allowed for sandbox mounts: {resolved}")
+
+    # Check against forbidden paths
+    forbidden_prefixes = []
+    if os.name == 'nt':
+        forbidden_prefixes = [
+            os.path.normcase("C:\\Windows"),
+            os.path.normcase("C:\\Program Files"),
+            os.path.normcase("C:\\Program Files (x86)"),
+            os.path.normcase("C:\\Users\\Default"),
+        ]
+        # Avoid mounting drive root
+        drive, tail = os.path.splitdrive(resolved)
+        if not tail or tail.strip(os.sep) == "":
+            raise ValueError(f"Mounting drive root is forbidden: {resolved}")
+    else:
+        forbidden_prefixes = [
+            "/etc", "/var", "/usr", "/bin", "/sbin", "/lib", "/sys", "/proc", "/dev", "/boot"
+        ]
+        if resolved == "/":
+            raise ValueError("Mounting root directory is forbidden")
+
+    norm_resolved = os.path.normcase(resolved)
+    for p in forbidden_prefixes:
+        if norm_resolved.startswith(p):
+            raise ValueError(f"Mounting system path is forbidden: {resolved}")
+
+    # Check if it looks like SSH, credentials, docker socket, etc.
+    forbidden_keywords = [".ssh", ".aws", ".docker", "docker.sock", "id_rsa"]
+    for kw in forbidden_keywords:
+        if kw in norm_resolved:
+            raise ValueError(f"Mounting sensitive credential/control path is forbidden: {resolved}")
+
+    return resolved
+
+
+class SandboxBackend(ABC):
+    """Abstraction for validation execution backends (local subprocess vs container)."""
+
+    @abstractmethod
+    def execute(
+        self,
+        runner_path: str,
+        repo_path: str,
+        payload_json: str,
+        timeout: float,
+        max_output_bytes: int
+    ) -> Tuple[str, str, int, bool, bool, Optional[str]]:
+        """Executes the validation runner.
+
+        Returns:
+            Tuple containing:
+            (stdout_data, stderr_data, returncode, timeout_hit, overflow_hit, error_message)
+        """
+        pass
+
+
+class SubprocessSandboxBackend(SandboxBackend):
+    """Local development/simulation subprocess validation backend."""
+
+    def __init__(self, reader_thread_fn):
+        self._reader_thread_fn = reader_thread_fn
+
+    def _writer_thread(self, stream: Any, data: str) -> None:
+        """Writes data to stdin stream pipe and closes it."""
+        try:
+            stream.write(data)
+            stream.close()
+        except Exception:
+            pass
+
+    def execute(
+        self,
+        runner_path: str,
+        repo_path: str,
+        payload_json: str,
+        timeout: float,
+        max_output_bytes: int
+    ) -> Tuple[str, str, int, bool, bool, Optional[str]]:
+        cmd = [sys.executable, "-u", runner_path]
+        env = dict(os.environ)
+        pythonpath = env.get("PYTHONPATH", "")
+        src_path = os.path.abspath("src")
+        if src_path not in pythonpath:
+            env["PYTHONPATH"] = f"{src_path}{os.pathsep}{pythonpath}".strip(os.pathsep)
+
+        start_time = time.perf_counter()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env
+            )
+        except Exception as e:
+            return "", "", -1, False, False, f"Failed to spawn subprocess: {str(e)}"
+
+        max_q_size = max(5, max_output_bytes // 1024 + 2)
+        q_out = queue.Queue(maxsize=max_q_size)
+        q_err = queue.Queue(maxsize=max_q_size)
+
+        counter = _CombinedOutputCounter(max_output_bytes)
+        overflow_event = threading.Event()
+        shutdown_event = threading.Event()
+
+        t_out = threading.Thread(
+            target=self._reader_thread_fn,
+            args=(proc.stdout, q_out, counter, proc, overflow_event, shutdown_event),
+            daemon=True
+        )
+        t_err = threading.Thread(
+            target=self._reader_thread_fn,
+            args=(proc.stderr, q_err, counter, proc, overflow_event, shutdown_event),
+            daemon=True
+        )
+        t_out.start()
+        t_err.start()
+
+        t_in = threading.Thread(target=self._writer_thread, args=(proc.stdin, payload_json), daemon=True)
+        t_in.start()
+
+        stdout_chunks = []
+        stderr_chunks = []
+        timeout_hit = False
+        overflow_hit = False
+
+        while True:
+            while not q_out.empty():
+                try:
+                    stdout_chunks.append(q_out.get_nowait())
+                except queue.Empty:
+                    break
+
+            while not q_err.empty():
+                try:
+                    stderr_chunks.append(q_err.get_nowait())
+                except queue.Empty:
+                    break
+
+            if overflow_event.is_set():
+                overflow_hit = True
+                break
+
+            if time.perf_counter() - start_time > timeout:
+                timeout_hit = True
+                break
+
+            ret = proc.poll()
+            if ret is not None:
+                break
+
+            time.sleep(0.01)
+
+        if overflow_hit or timeout_hit:
+            shutdown_event.set()
+            if not overflow_hit:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            proc.wait()
+            try:
+                proc.stdout.close()
+                proc.stderr.close()
+            except Exception:
+                pass
+            return "".join(stdout_chunks), "".join(stderr_chunks), proc.returncode, timeout_hit, overflow_hit, None
+
+        proc.wait()
+        t_out.join(timeout=1.0)
+        t_err.join(timeout=1.0)
+        shutdown_event.set()
+
+        while not q_out.empty():
+            try:
+                stdout_chunks.append(q_out.get_nowait())
+            except queue.Empty:
+                break
+        while not q_err.empty():
+            try:
+                stderr_chunks.append(q_err.get_nowait())
+            except queue.Empty:
+                break
+
+        try:
+            proc.stdout.close()
+            proc.stderr.close()
+        except Exception:
+            pass
+
+        return "".join(stdout_chunks), "".join(stderr_chunks), proc.returncode, False, False, None
+
+
+class DockerSandboxBackend(SandboxBackend):
+    """Isolated container validation execution backend using Docker."""
+
+    def __init__(self, reader_thread_fn, image_name: str = "python:3.11-slim"):
+        self._reader_thread_fn = reader_thread_fn
+        self.image_name = image_name
+
+    def _writer_thread(self, stream: Any, data: str) -> None:
+        """Writes data to stdin stream pipe and closes it."""
+        try:
+            stream.write(data)
+            stream.close()
+        except Exception:
+            pass
+
+    def _kill_container(self, container_name: str, proc: subprocess.Popen) -> None:
+        """Forcefully kills and removes the container and its wrapper process."""
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            subprocess.run(["docker", "kill", container_name], capture_output=True, timeout=5)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["docker", "rm", "-f", container_name], capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+    def execute(
+        self,
+        runner_path: str,
+        repo_path: str,
+        payload_json: str,
+        timeout: float,
+        max_output_bytes: int
+    ) -> Tuple[str, str, int, bool, bool, Optional[str]]:
+        # 1. Path containment validations on the host side before mounting
+        try:
+            valid_repo_path = _validate_mount_path(repo_path)
+            valid_runner_path = _validate_mount_path(runner_path)
+        except Exception as e:
+            return "", "", -1, False, False, f"Preflight path validation failed: {str(e)}"
+
+        container_name = f"breakglass-sandbox-{uuid.uuid4().hex}"
+
+        # 2. Construct container execution command line with privilege & network isolation
+        cmd = [
+            "docker", "run",
+            "--name", container_name,
+            "--rm",
+            "-i",
+            "--network", "none",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--user", "1000:1000",
+            "--memory", "256m",
+            "--cpus", "1.0",
+            "--pids-limit", "64",
+            "-v", f"{valid_repo_path}:/workspace:ro",
+            "-v", f"{valid_runner_path}:/app/sandbox_runner.py:ro",
+            "-w", "/workspace",
+            self.image_name,
+            "python", "-u", "/app/sandbox_runner.py"
+        ]
+
+        start_time = time.perf_counter()
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+        except Exception as e:
+            return "", "", -1, False, False, f"Failed to spawn docker process: {str(e)}"
+
+        max_q_size = max(5, max_output_bytes // 1024 + 2)
+        q_out = queue.Queue(maxsize=max_q_size)
+        q_err = queue.Queue(maxsize=max_q_size)
+
+        counter = _CombinedOutputCounter(max_output_bytes)
+        overflow_event = threading.Event()
+        shutdown_event = threading.Event()
+
+        # Wrap kill_container to use Docker-specific teardown
+        def docker_kill_fn():
+            self._kill_container(container_name, proc)
+
+        # Modify reader thread target slightly or patch proc.kill to handle docker cleanup
+        class ProcProxy:
+            def __init__(self, original_proc, kill_fn):
+                self._proc = original_proc
+                self._kill_fn = kill_fn
+            def kill(self):
+                self._kill_fn()
+            def __getattr__(self, name):
+                return getattr(self._proc, name)
+
+        proc_proxy = ProcProxy(proc, docker_kill_fn)
+
+        t_out = threading.Thread(
+            target=self._reader_thread_fn,
+            args=(proc.stdout, q_out, counter, proc_proxy, overflow_event, shutdown_event),
+            daemon=True
+        )
+        t_err = threading.Thread(
+            target=self._reader_thread_fn,
+            args=(proc.stderr, q_err, counter, proc_proxy, overflow_event, shutdown_event),
+            daemon=True
+        )
+        t_out.start()
+        t_err.start()
+
+        t_in = threading.Thread(target=self._writer_thread, args=(proc.stdin, payload_json), daemon=True)
+        t_in.start()
+
+        stdout_chunks = []
+        stderr_chunks = []
+        timeout_hit = False
+        overflow_hit = False
+
+        while True:
+            while not q_out.empty():
+                try:
+                    stdout_chunks.append(q_out.get_nowait())
+                except queue.Empty:
+                    break
+
+            while not q_err.empty():
+                try:
+                    stderr_chunks.append(q_err.get_nowait())
+                except queue.Empty:
+                    break
+
+            if overflow_event.is_set():
+                overflow_hit = True
+                break
+
+            if time.perf_counter() - start_time > timeout:
+                timeout_hit = True
+                break
+
+            ret = proc.poll()
+            if ret is not None:
+                break
+
+            time.sleep(0.01)
+
+        if overflow_hit or timeout_hit:
+            shutdown_event.set()
+            docker_kill_fn()
+            proc.wait()
+            try:
+                proc.stdout.close()
+                proc.stderr.close()
+            except Exception:
+                pass
+            return "".join(stdout_chunks), "".join(stderr_chunks), proc.returncode, timeout_hit, overflow_hit, None
+
+        proc.wait()
+        t_out.join(timeout=1.0)
+        t_err.join(timeout=1.0)
+        shutdown_event.set()
+
+        while not q_out.empty():
+            try:
+                stdout_chunks.append(q_out.get_nowait())
+            except queue.Empty:
+                break
+        while not q_err.empty():
+            try:
+                stderr_chunks.append(q_err.get_nowait())
+            except queue.Empty:
+                break
+
+        try:
+            proc.stdout.close()
+            proc.stderr.close()
+        except Exception:
+            pass
+
+        return "".join(stdout_chunks), "".join(stderr_chunks), proc.returncode, False, False, None
+
+
 class TrueForgeSandboxValidator(SandboxValidator):
     """Adapter boundary for the TrueForge execution sandbox."""
 
@@ -88,6 +488,8 @@ class TrueForgeSandboxValidator(SandboxValidator):
         api_key: Optional[str] = None,
         endpoint: Optional[str] = None,
         local_sandbox: bool = False,
+        container_sandbox: bool = False,
+        image_name: Optional[str] = None,
         timeout_seconds: Optional[float] = None,
         max_output_bytes: Optional[int] = None
     ):
@@ -95,6 +497,8 @@ class TrueForgeSandboxValidator(SandboxValidator):
         self.api_key = api_key or os.environ.get("TRUEFORGE_API_KEY")
         self.endpoint = endpoint or os.environ.get("TRUEFORGE_ENDPOINT", "https://api.trueforge.example.com")
         self.local_sandbox = local_sandbox or (os.environ.get("TRUEFORGE_LOCAL_SANDBOX") == "true")
+        self.container_sandbox = container_sandbox or (os.environ.get("TRUEFORGE_CONTAINER_SANDBOX") == "true")
+        self.image_name = image_name or os.environ.get("TRUEFORGE_SANDBOX_IMAGE", "python:3.11-slim")
 
         # Read limits
         self.timeout_seconds = timeout_seconds or float(os.environ.get("TRUEFORGE_TIMEOUT", "30.0"))
@@ -120,7 +524,7 @@ class TrueForgeSandboxValidator(SandboxValidator):
         stream: Any,
         q: queue.Queue,
         counter: _CombinedOutputCounter,
-        proc: subprocess.Popen,
+        proc: Any,
         overflow_event: threading.Event,
         shutdown_event: threading.Event
     ) -> None:
@@ -166,176 +570,60 @@ class TrueForgeSandboxValidator(SandboxValidator):
         except Exception:
             pass
 
-    def _execute_local_sandbox(
+    def _execute_sandbox(
         self,
+        backend: SandboxBackend,
         hypothesis: SecurityHypothesis,
-        repository_context: RepositoryReport
+        payload_json: str,
+        runner_path: str,
+        repo_path: str
     ) -> ValidationResult:
-        """Spawns an isolated Python subprocess sandbox runner to validate codebase."""
-        # 1. Construct serialized request payload strictly from authoritative data
-        payload = {
-            "hypothesis": self._to_canonical_dict(hypothesis),
-            "report": self._to_canonical_dict(repository_context)
-        }
-        json_input = json.dumps(payload)
-
-        # 2. Run runner module in separate Python process with configured environment path
-        cmd = [sys.executable, "-m", "breakglass.validation.sandbox_runner"]
-        env = dict(os.environ)
-        pythonpath = env.get("PYTHONPATH", "")
-        src_path = os.path.abspath("src")
-        if src_path not in pythonpath:
-            env["PYTHONPATH"] = f"{src_path}{os.pathsep}{pythonpath}".strip(os.pathsep)
-
         start_time = time.perf_counter()
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env
-            )
-        except Exception as e:
-            return ValidationResult(
-                hypothesis_id=hypothesis.id,
-                status=ValidationStatus.SANDBOX_ERROR,
-                attempted=True,
-                confirmed=False,
-                error_message=f"Failed to spawn sandbox subprocess: {str(e)}"
-            )
 
-        # 3. Use thread readers and non-blocking writer to actively enforce combined limits
-        max_q_size = max(5, self.max_output_bytes // 1024 + 2)
-        q_out = queue.Queue(maxsize=max_q_size)
-        q_err = queue.Queue(maxsize=max_q_size)
-
-        counter = _CombinedOutputCounter(self.max_output_bytes)
-        overflow_event = threading.Event()
-        shutdown_event = threading.Event()
-
-        t_out = threading.Thread(
-            target=self._reader_thread,
-            args=(proc.stdout, q_out, counter, proc, overflow_event, shutdown_event),
-            daemon=True
+        stdout_data, stderr_data, returncode, timeout_hit, overflow_hit, error_message = backend.execute(
+            runner_path=runner_path,
+            repo_path=repo_path,
+            payload_json=payload_json,
+            timeout=self.timeout_seconds,
+            max_output_bytes=self.max_output_bytes
         )
-        t_err = threading.Thread(
-            target=self._reader_thread,
-            args=(proc.stderr, q_err, counter, proc, overflow_event, shutdown_event),
-            daemon=True
-        )
-        t_out.start()
-        t_err.start()
-
-        # Send input via background non-blocking writer thread to avoid pipe buffer deadlocks
-        t_in = threading.Thread(target=self._writer_thread, args=(proc.stdin, json_input), daemon=True)
-        t_in.start()
-
-        stdout_chunks = []
-        stderr_chunks = []
-
-        timeout_hit = False
-        overflow_hit = False
-
-        while True:
-            # Drain stdout
-            while not q_out.empty():
-                try:
-                    chunk = q_out.get_nowait()
-                    stdout_chunks.append(chunk)
-                except queue.Empty:
-                    break
-
-            # Drain stderr
-            while not q_err.empty():
-                try:
-                    chunk = q_err.get_nowait()
-                    stderr_chunks.append(chunk)
-                except queue.Empty:
-                    break
-
-            if overflow_event.is_set():
-                overflow_hit = True
-                break
-
-            if time.perf_counter() - start_time > self.timeout_seconds:
-                timeout_hit = True
-                break
-
-            ret = proc.poll()
-            if ret is not None:
-                break
-
-            time.sleep(0.01)
 
         duration = time.perf_counter() - start_time
 
-        # Clean up subprocess securely (fail closed)
-        if overflow_hit or timeout_hit:
-            shutdown_event.set()
-            if not overflow_hit:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-            proc.wait()
-            try:
-                proc.stdout.close()
-                proc.stderr.close()
-            except Exception:
-                pass
-
-            if overflow_hit:
-                return ValidationResult(
-                    hypothesis_id=hypothesis.id,
-                    status=ValidationStatus.SANDBOX_ERROR,
-                    attempted=True,
-                    confirmed=False,
-                    error_message=f"Sandbox execution aborted: combined output size exceeded limit of {self.max_output_bytes} bytes"
-                )
-            else:
-                return ValidationResult(
-                    hypothesis_id=hypothesis.id,
-                    status=ValidationStatus.TIMEOUT,
-                    attempted=True,
-                    confirmed=False,
-                    error_message=f"Sandbox execution timed out after {self.timeout_seconds} seconds"
-                )
-
-        # Wait for the process to exit completely and drain the queues
-        proc.wait()
-        t_out.join(timeout=1.0)
-        t_err.join(timeout=1.0)
-        shutdown_event.set()
-
-        while not q_out.empty():
-            try:
-                stdout_chunks.append(q_out.get_nowait())
-            except queue.Empty:
-                break
-        while not q_err.empty():
-            try:
-                stderr_chunks.append(q_err.get_nowait())
-            except queue.Empty:
-                break
-
-        stdout_data = "".join(stdout_chunks)
-        stderr_data = "".join(stderr_chunks)
-
-        try:
-            proc.stdout.close()
-            proc.stderr.close()
-        except Exception:
-            pass
-
-        if proc.returncode != 0:
+        if error_message:
             return ValidationResult(
                 hypothesis_id=hypothesis.id,
                 status=ValidationStatus.SANDBOX_ERROR,
                 attempted=True,
                 confirmed=False,
-                error_message=f"Sandbox process exited with code {proc.returncode}. Stderr: {stderr_data.strip()}"
+                error_message=error_message
+            )
+
+        if overflow_hit:
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message=f"Sandbox execution aborted: combined output size exceeded limit of {self.max_output_bytes} bytes"
+            )
+
+        if timeout_hit:
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.TIMEOUT,
+                attempted=True,
+                confirmed=False,
+                error_message=f"Sandbox execution timed out after {self.timeout_seconds} seconds"
+            )
+
+        if returncode != 0:
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.SANDBOX_ERROR,
+                attempted=True,
+                confirmed=False,
+                error_message=f"Sandbox process exited with code {returncode}. Stderr: {stderr_data.strip()}"
             )
 
         # 4. JSON Payload Schema Validation
@@ -517,6 +805,44 @@ class TrueForgeSandboxValidator(SandboxValidator):
             metadata=metadata_val
         )
 
+    def _execute_local_sandbox(
+        self,
+        hypothesis: SecurityHypothesis,
+        repository_context: RepositoryReport
+    ) -> ValidationResult:
+        """Spawns an isolated Python subprocess sandbox runner to validate codebase."""
+        payload = {
+            "hypothesis": self._to_canonical_dict(hypothesis),
+            "report": self._to_canonical_dict(repository_context)
+        }
+        json_input = json.dumps(payload)
+
+        runner_path = os.path.abspath(os.path.join("src", "breakglass", "validation", "sandbox_runner.py"))
+        repo_path = os.path.abspath(repository_context.repository.root)
+
+        backend = SubprocessSandboxBackend(self._reader_thread)
+        return self._execute_sandbox(backend, hypothesis, json_input, runner_path, repo_path)
+
+    def _execute_container_sandbox(
+        self,
+        hypothesis: SecurityHypothesis,
+        repository_context: RepositoryReport
+    ) -> ValidationResult:
+        """Spawns an isolated Docker container sandbox runner to validate codebase."""
+        payload = {
+            "hypothesis": self._to_canonical_dict(hypothesis),
+            "report": self._to_canonical_dict(repository_context)
+        }
+        # Enforce that repository root is set to /workspace inside the container
+        payload["report"]["repository"]["root"] = "/workspace"
+        json_input = json.dumps(payload)
+
+        runner_path = os.path.abspath(os.path.join("src", "breakglass", "validation", "sandbox_runner.py"))
+        repo_path = os.path.abspath(repository_context.repository.root)
+
+        backend = DockerSandboxBackend(self._reader_thread, image_name=self.image_name)
+        return self._execute_sandbox(backend, hypothesis, json_input, runner_path, repo_path)
+
     def validate(
         self,
         hypothesis: SecurityHypothesis,
@@ -524,7 +850,7 @@ class TrueForgeSandboxValidator(SandboxValidator):
     ) -> ValidationResult:
         """Executes verification inside the TrueForge container workspace."""
         # Safety/Preflight checks: Enforce fail-closed for sandbox configuration errors
-        if not self.local_sandbox and not self.api_key:
+        if not self.local_sandbox and not self.container_sandbox and not self.api_key:
             return ValidationResult(
                 hypothesis_id=hypothesis.id,
                 status=ValidationStatus.PREFLIGHT_ERROR,
@@ -534,11 +860,12 @@ class TrueForgeSandboxValidator(SandboxValidator):
             )
 
         # Dispatch execution
-        if self.local_sandbox:
+        if self.container_sandbox:
+            return self._execute_container_sandbox(hypothesis, repository_context)
+        elif self.local_sandbox:
             return self._execute_local_sandbox(hypothesis, repository_context)
 
         # Remote API orchestration mode placeholder:
-        # Does NOT return VALIDATED/confirmed=True (Finding 1 fix)
         return ValidationResult(
             hypothesis_id=hypothesis.id,
             status=ValidationStatus.NOT_ATTEMPTED,

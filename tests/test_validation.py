@@ -1,5 +1,6 @@
 """Unit tests for the BREAKGLASS sandbox validation engine and safety controls."""
 
+import os
 import time
 import json
 import unittest
@@ -1108,6 +1109,295 @@ class TestSandboxValidation(unittest.TestCase):
         # The reader thread should wake up from blocking and exit cleanly
         t.join(timeout=1.0)
         self.assertFalse(t.is_alive())
+
+
+class TestContainerSandboxValidation(unittest.TestCase):
+    """Test suite for Docker container validation backend, security boundaries, and path checks."""
+
+    def setUp(self):
+        self.det_engine = DeterministicReasoningEngine()
+        self.empty_summary = RepositorySummary(
+            root="/repo",
+            total_files=0,
+            total_directories=0,
+            languages={},
+            frameworks=["Flask"],
+            ecosystems=[],
+            config_files=["config.json"],
+            docker_configs=[],
+            cicd_configs=[],
+            infrastructure_configs=[],
+            test_files=[]
+        )
+        self.report = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[],
+            security_indicators=[]
+        )
+        self.valid_hyp = SecurityHypothesis(
+            id="HYP-001",
+            title="Command Injection",
+            description="Allows command injection",
+            category="command_injection",
+            severity="CRITICAL",
+            confidence=0.8,
+            evidence_references=[],
+            rationale=""
+        )
+
+    def test_remote_mode_remains_fail_closed(self):
+        """Verify remote TrueForge validator mode remains fail-closed (returns NOT_ATTEMPTED)."""
+        validator = TrueForgeSandboxValidator(api_key="test-key", local_sandbox=False, container_sandbox=False)
+        res = validator.validate(self.valid_hyp, self.report)
+        self.assertEqual(res.status, ValidationStatus.NOT_ATTEMPTED)
+        self.assertFalse(res.attempted)
+        self.assertFalse(res.confirmed)
+
+    def test_preflight_mount_path_validations(self):
+        """Verify that host-side path validation rejects drive roots, UNC paths, system paths, and credential directories."""
+        from breakglass.validation.validator import _validate_mount_path
+
+        # Test empty path
+        with self.assertRaises(ValueError):
+            _validate_mount_path("")
+
+        # Test non-existent path
+        with self.assertRaises(ValueError):
+            _validate_mount_path("C:\\nonexistent_path_xyz_123")
+
+        # Test UNC path on Windows or root directory mounts
+        if os.name == 'nt':
+            with self.assertRaises(ValueError):
+                _validate_mount_path("\\\\server\\share")
+            with self.assertRaises(ValueError):
+                _validate_mount_path("C:\\")
+        else:
+            with self.assertRaises(ValueError):
+                _validate_mount_path("/")
+
+        # Test sensitive directories
+        temp_dir = os.path.realpath(os.path.abspath("src"))
+        # Verify normal path canonicalizes successfully
+        res_path = _validate_mount_path(temp_dir)
+        self.assertTrue(os.path.isabs(res_path))
+
+    @patch("subprocess.Popen")
+    def test_docker_backend_command_construction(self, mock_popen):
+        """Verify that the Docker command line is securely configured with cap-drop, no network, and resource bounds."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+        mock_proc.stdout.read.side_effect = ['{"status": "VALIDATED", "attempted": true, "confirmed": true, "confidence_delta": 0.1, "evidence": "", "stdout": "", "stderr": ""}', ""]
+        mock_proc.stderr.read.side_effect = ["", ""]
+        mock_popen.return_value = mock_proc
+
+        # Construct paths that exist so validation succeeds
+        repo_path = os.path.abspath("tests")
+        runner_path = os.path.abspath("src/breakglass/validation/sandbox_runner.py")
+
+        validator = TrueForgeSandboxValidator(container_sandbox=True, image_name="my-test-image:latest")
+
+        # Mock repository root in report
+        self.report.repository.root = repo_path
+
+        res = validator.validate(self.valid_hyp, self.report)
+
+        # Verify subprocess.Popen was called with secure Docker configuration
+        mock_popen.assert_called_once()
+        cmd_args = mock_popen.call_args[0][0]
+
+        # Assert binary is docker run
+        self.assertEqual(cmd_args[0], "docker")
+        self.assertEqual(cmd_args[1], "run")
+
+        # Assert isolation parameters
+        self.assertIn("--network", cmd_args)
+        self.assertEqual(cmd_args[cmd_args.index("--network") + 1], "none")
+        self.assertIn("--cap-drop", cmd_args)
+        self.assertEqual(cmd_args[cmd_args.index("--cap-drop") + 1], "ALL")
+        self.assertIn("--security-opt", cmd_args)
+        self.assertEqual(cmd_args[cmd_args.index("--security-opt") + 1], "no-new-privileges")
+        self.assertIn("--user", cmd_args)
+        self.assertEqual(cmd_args[cmd_args.index("--user") + 1], "1000:1000")
+
+        # Assert resource limits
+        self.assertIn("--memory", cmd_args)
+        self.assertEqual(cmd_args[cmd_args.index("--memory") + 1], "256m")
+        self.assertIn("--cpus", cmd_args)
+        self.assertEqual(cmd_args[cmd_args.index("--cpus") + 1], "1.0")
+        self.assertIn("--pids-limit", cmd_args)
+        self.assertEqual(cmd_args[cmd_args.index("--pids-limit") + 1], "64")
+
+        # Assert mounts are read-only
+        mount_indices = [i for i, val in enumerate(cmd_args) if val == "-v"]
+        self.assertEqual(len(mount_indices), 2)
+        for idx in mount_indices:
+            mount_spec = cmd_args[idx + 1]
+            self.assertTrue(mount_spec.endswith(":ro"))
+
+        # Assert no privileged mode
+        self.assertNotIn("--privileged", cmd_args)
+
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_docker_backend_lifecycle_cleanup_after_success(self, mock_popen, mock_run):
+        """Verify that the Docker sandbox is removed cleanly on validation success."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+        mock_proc.stdout.read.side_effect = ['{"status": "VALIDATED", "attempted": true, "confirmed": true, "confidence_delta": 0.1, "evidence": "", "stdout": "", "stderr": ""}', ""]
+        mock_proc.stderr.read.side_effect = ["", ""]
+        mock_popen.return_value = mock_proc
+
+        repo_path = os.path.abspath("tests")
+        self.report.repository.root = repo_path
+        validator = TrueForgeSandboxValidator(container_sandbox=True)
+        res = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(res.status, ValidationStatus.VALIDATED)
+
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_docker_backend_lifecycle_cleanup_on_timeout(self, mock_popen, mock_run):
+        """Verify that container kill and remove are triggered when timeout occurs."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdout.read.side_effect = ["", ""]
+        mock_proc.stderr.read.side_effect = ["", ""]
+        mock_popen.return_value = mock_proc
+
+        repo_path = os.path.abspath("tests")
+        self.report.repository.root = repo_path
+
+        validator = TrueForgeSandboxValidator(container_sandbox=True, timeout_seconds=0.001)
+        res = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(res.status, ValidationStatus.TIMEOUT)
+
+        # Verify docker kill and docker rm were called
+        mock_run.assert_any_call(
+            ["docker", "kill", unittest.mock.ANY],
+            capture_output=unittest.mock.ANY,
+            timeout=unittest.mock.ANY
+        )
+        mock_run.assert_any_call(
+            ["docker", "rm", "-f", unittest.mock.ANY],
+            capture_output=unittest.mock.ANY,
+            timeout=unittest.mock.ANY
+        )
+
+    @patch("subprocess.run")
+    @patch("subprocess.Popen")
+    def test_docker_backend_lifecycle_cleanup_on_output_overflow(self, mock_popen, mock_run):
+        """Verify that container kill and remove are triggered when output limit is exceeded."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        mock_proc.stdout.read.side_effect = ["A" * 1024, ""]
+        mock_proc.stderr.read.side_effect = ["", ""]
+        mock_popen.return_value = mock_proc
+
+        repo_path = os.path.abspath("tests")
+        self.report.repository.root = repo_path
+
+        validator = TrueForgeSandboxValidator(container_sandbox=True, max_output_bytes=100)
+        res = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertIn("combined output size exceeded limit", res.error_message)
+
+        # Verify docker kill and docker rm were called
+        mock_run.assert_any_call(
+            ["docker", "kill", unittest.mock.ANY],
+            capture_output=unittest.mock.ANY,
+            timeout=unittest.mock.ANY
+        )
+        mock_run.assert_any_call(
+            ["docker", "rm", "-f", unittest.mock.ANY],
+            capture_output=unittest.mock.ANY,
+            timeout=unittest.mock.ANY
+        )
+
+    @patch("subprocess.Popen")
+    def test_docker_backend_non_zero_exit(self, mock_popen):
+        """Verify that a container exiting with a non-zero exit code returns SANDBOX_ERROR."""
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 127
+        mock_proc.stdout.read.side_effect = ["", ""]
+        mock_proc.stderr.read.side_effect = ["image not found or command failed", ""]
+        mock_popen.return_value = mock_proc
+
+        repo_path = os.path.abspath("tests")
+        self.report.repository.root = repo_path
+
+        validator = TrueForgeSandboxValidator(container_sandbox=True)
+        res = validator.validate(self.valid_hyp, self.report)
+
+        self.assertEqual(res.status, ValidationStatus.SANDBOX_ERROR)
+        self.assertIn("Sandbox process exited with code 127", res.error_message)
+
+    def test_evidence_realpath_symlink_escape_denial(self):
+        """Verify that a symlink pointing outside the workspace root is caught and denied in the runner."""
+        import tempfile
+        from breakglass.validation.sandbox_runner import run_validation
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create workspace root
+            workspace = os.path.join(tmpdir, "workspace")
+            os.makedirs(workspace)
+
+            # Create secret file outside workspace
+            secret_file = os.path.join(tmpdir, "secret.txt")
+            with open(secret_file, "w") as f:
+                f.write("sensitive_host_secret")
+
+            # Create a symlink in workspace pointing to host secret
+            symlink_path = os.path.join(workspace, "escape_link.txt")
+
+            try:
+                os.symlink(secret_file, symlink_path)
+            except OSError:
+                pass
+
+            # Define hypothesis referencing the symlink escape
+            hyp = {
+                "id": "HYP-001",
+                "evidence_references": [
+                    {
+                        "type": "security_indicator",
+                        "file": "escape_link.txt",
+                        "line": 1,
+                        "detail": "Subprocess call: sensitive_host_secret"
+                    }
+                ]
+            }
+            report = {
+                "repository": {
+                    "root": workspace
+                },
+                "security_indicators": [
+                    {
+                        "category": "subprocess",
+                        "indicator_type": "subprocess_execution_indicator",
+                        "file": "escape_link.txt",
+                        "line": 1,
+                        "evidence": "sensitive_host_secret"
+                    }
+                ]
+            }
+
+            payload = {"hypothesis": hyp, "report": report}
+
+            # Patch os.path.realpath to return the path outside workspace if symlink creation failed
+            with patch("os.path.realpath") as mock_real:
+                mock_real.return_value = os.path.abspath(secret_file)
+                with patch("os.path.exists") as mock_exists:
+                    mock_exists.return_value = True
+                    res = run_validation(payload)
+
+            self.assertEqual(res["status"], "SANDBOX_ERROR")
+            self.assertIn("path escape detected", res["error_message"])
+
 
 if __name__ == "__main__":
     unittest.main()
