@@ -35,6 +35,8 @@ class SecurityHypothesis:
     confidence: float
     evidence_references: List[EvidenceReference] = field(default_factory=list)
     rationale: str = ""
+    affected_paths: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -45,7 +47,9 @@ class SecurityHypothesis:
             "severity": self.severity,
             "confidence": round(self.confidence, 2),
             "evidence_references": [ref.to_dict() for ref in self.evidence_references],
-            "rationale": self.rationale
+            "rationale": self.rationale,
+            "affected_paths": self.affected_paths,
+            "metadata": self.metadata
         }
 
 
@@ -64,7 +68,7 @@ class ReasoningReport:
         }
 
     def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
+        return json.dumps(self.to_dict(), indent=indent, allow_nan=False)
 
 
 def generate_hypothesis_id(category: str, identity: Dict[str, Any], is_llm: bool = False) -> str:

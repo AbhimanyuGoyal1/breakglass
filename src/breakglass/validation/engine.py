@@ -176,13 +176,28 @@ class ValidationEngine:
     def _match_indicator_detail(self, ind: Any, detail: str) -> bool:
         """Checks if a SecurityIndicator matches the specified detail string pattern."""
         if ind.category == "subprocess":
-            return detail == f"Subprocess call: {ind.evidence}"
+            return detail in (f"Subprocess call: {ind.evidence}", f"Security indicator: {ind.evidence}")
         elif ind.category == "database":
-            return detail == f"Database indicator: {ind.evidence}"
+            return detail in (f"Database indicator: {ind.evidence}", f"Security indicator: {ind.evidence}")
         elif ind.category == "serialization":
-            return detail == f"Serialization call: {ind.evidence}"
+            return detail in (f"Serialization call: {ind.evidence}", f"Security indicator: {ind.evidence}")
         elif ind.category in ("cloud_sdk", "secret_config"):
-            return detail == f"Cloud/Secrets indicator: {ind.evidence}"
+            return detail in (
+                f"Cloud/Secrets indicator: {ind.evidence}",
+                f"Exposed secret configuration reference: {ind.evidence}",
+                f"Exposed secret config: {ind.evidence}",
+                f"Security indicator: {ind.evidence}"
+            )
+        elif ind.category in ("authentication", "authorization"):
+            return detail in (
+                f"Access control: {ind.evidence}",
+                f"Security indicator: {ind.evidence}"
+            )
+        elif ind.category == "filesystem":
+            return detail in (
+                f"Filesystem access: {ind.evidence}",
+                f"Security indicator: {ind.evidence}"
+            )
         else:
             return detail == f"Security indicator: {ind.evidence}"
 
@@ -371,7 +386,7 @@ class ValidationEngine:
                 if not ind:
                     return False
                 sorted_frameworks = sorted(list(set(report.repository.frameworks)))
-                identity = {
+                identity_correlation = {
                     "rule": "credential_exposure",
                     "ind": {
                         "category": ind.category,
@@ -381,6 +396,101 @@ class ValidationEngine:
                         "evidence": ind.evidence
                     },
                     "frameworks": sorted_frameworks
+                }
+                identity_standalone = {
+                    "rule": "ind_secret",
+                    "file": ind.file,
+                    "line": ind.line,
+                    "evidence": ind.evidence
+                }
+                id_corr = generate_hypothesis_id(hypothesis.category, identity_correlation, is_llm=False)
+                id_stan = generate_hypothesis_id(hypothesis.category, identity_standalone, is_llm=False)
+                if hypothesis.id == id_corr:
+                    identity = identity_correlation
+                elif hypothesis.id == id_stan:
+                    identity = identity_standalone
+                else:
+                    return False
+            elif hypothesis.category == "insecure_auth":
+                if not ind:
+                    return False
+                identity = {
+                    "rule": "ind_auth",
+                    "file": ind.file,
+                    "line": ind.line,
+                    "evidence": ind.evidence
+                }
+            elif hypothesis.category == "path_traversal":
+                if not ind:
+                    return False
+                identity = {
+                    "rule": "ind_file",
+                    "file": ind.file,
+                    "line": ind.line,
+                    "evidence": ind.evidence
+                }
+            elif hypothesis.category == "insecure_dependency":
+                file_ref = next((r for r in canonical_references if r.type == "file"), None)
+                if not file_ref:
+                    return False
+                m = next((x for x in report.manifests if x.file == file_ref.file), None)
+                if not m:
+                    return False
+                target_deps = [d for d in m.dependencies if d.lower() in ("express", "fastapi", "flask", "django", "requests", "boto3", "actix-web")]
+                identity = {
+                    "rule": "manifest_deps",
+                    "file": m.file,
+                    "deps": sorted(target_deps)
+                }
+            elif hypothesis.category == "exposed_debug":
+                route_ref = next((r for r in canonical_references if r.type == "route"), None)
+                route = None
+                if route_ref:
+                    route = next((r for r in report.routes if r.file == route_ref.file and r.line == route_ref.line), None)
+                if not route:
+                    return False
+                identity = {
+                    "rule": "route_debug",
+                    "file": route.file,
+                    "line": route.line,
+                    "pattern": route.pattern
+                }
+            elif hypothesis.category == "insecure_config":
+                file_ref = next((r for r in canonical_references if r.type == "file"), None)
+                if not file_ref:
+                    return False
+                identity = {
+                    "rule": "summary_config",
+                    "file": file_ref.file
+                }
+            elif hypothesis.category == "dangerous_cicd":
+                file_ref = next((r for r in canonical_references if r.type == "file"), None)
+                if not file_ref:
+                    return False
+                identity = {
+                    "rule": "summary_cicd",
+                    "file": file_ref.file
+                }
+            elif hypothesis.category == "infrastructure_misconfig":
+                file_ref = next((r for r in canonical_references if r.type == "file"), None)
+                if not file_ref:
+                    return False
+                identity = {
+                    "rule": "summary_docker",
+                    "file": file_ref.file
+                }
+            elif hypothesis.category == "network_exposure":
+                ep_ref = next((r for r in canonical_references if r.type == "entry_point"), None)
+                ep = None
+                if ep_ref:
+                    ep = next((e for e in report.entry_points if e.file == ep_ref.file and e.line == ep_ref.line), None)
+                if not ep:
+                    return False
+                identity = {
+                    "rule": "summary_ep",
+                    "file": ep.file,
+                    "type": ep.type,
+                    "line": ep.line
                 }
             else:
                 return False
@@ -459,6 +569,13 @@ class ValidationEngine:
             "path_traversal",
             "broken_access_control",
             "insecure_authentication",
+            "insecure_auth",
+            "insecure_dependency",
+            "exposed_debug",
+            "insecure_config",
+            "dangerous_cicd",
+            "infrastructure_misconfig",
+            "network_exposure",
         }
         if not isinstance(hypothesis.category, str) or hypothesis.category not in supported_categories:
             return False, f"Unsupported or invalid category: {hypothesis.category}"

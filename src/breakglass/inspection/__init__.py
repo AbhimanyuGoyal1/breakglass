@@ -7,12 +7,18 @@ from breakglass.inspection.models import (
     RouteCandidate,
     EntryPointCandidate,
     ManifestInfo,
-    InspectionError
+    InspectionError,
+    InspectionLimits
 )
-from breakglass.inspection.scanner import inspect_repository
+from breakglass.inspection.scanner import inspect_repository, RepositoryInspectionEngine, inspect
+from breakglass.inspection.detectors import classify_file
+from breakglass.inspection.indicators import redact_secrets
 
 __all__ = [
     "inspect_repository",
+    "RepositoryInspectionEngine",
+    "inspect",
+    "InspectionLimits",
     "RepositoryReport",
     "RepositorySummary",
     "SecurityIndicator",
@@ -20,4 +26,6 @@ __all__ = [
     "EntryPointCandidate",
     "ManifestInfo",
     "InspectionError",
+    "classify_file",
+    "redact_secrets"
 ]

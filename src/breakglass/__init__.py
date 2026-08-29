@@ -1,6 +1,6 @@
 """BREAKGLASS: Autonomous security assessment agent."""
 
-from breakglass.inspection import inspect_repository, RepositoryReport
+from breakglass.inspection import inspect_repository, RepositoryReport, inspect, RepositoryInspectionEngine
 from breakglass.reasoning import (
     EvidenceReference,
     SecurityHypothesis,
@@ -24,9 +24,12 @@ from breakglass.validation import (
     ValidationConfig,
     ValidationEngine
 )
+from breakglass.hypothesis import SecurityHypothesisGenerator, HypothesisConfig
 
 __all__ = [
     "inspect_repository",
+    "inspect",
+    "RepositoryInspectionEngine",
     "RepositoryReport",
     "EvidenceReference",
     "SecurityHypothesis",
@@ -44,7 +47,9 @@ __all__ = [
     "MockSandboxValidator",
     "TrueForgeSandboxValidator",
     "ValidationConfig",
-    "ValidationEngine"
+    "ValidationEngine",
+    "SecurityHypothesisGenerator",
+    "HypothesisConfig"
 ]
 __version__ = "0.1.0"
 
