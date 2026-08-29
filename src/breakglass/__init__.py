@@ -24,6 +24,7 @@ from breakglass.validation import (
     ValidationConfig,
     ValidationEngine
 )
+from breakglass.hypothesis import SecurityHypothesisGenerator, HypothesisConfig
 
 __all__ = [
     "inspect_repository",
@@ -46,7 +47,9 @@ __all__ = [
     "MockSandboxValidator",
     "TrueForgeSandboxValidator",
     "ValidationConfig",
-    "ValidationEngine"
+    "ValidationEngine",
+    "SecurityHypothesisGenerator",
+    "HypothesisConfig"
 ]
 __version__ = "0.1.0"
 
