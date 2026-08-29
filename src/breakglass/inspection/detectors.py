@@ -106,54 +106,66 @@ def detect_language(file_path: Path) -> Optional[str]:
     return EXTENSION_LANGUAGE_MAP.get(ext)
 
 
-def parse_manifest_file(file_path: Path, rel_path_str: str) -> Optional[ManifestInfo]:
-    """Safely parses package/dependency manifest files."""
+def parse_manifest_file(file_path: Path, rel_path_str: str, config: Optional[Any] = None, remaining_budget: Optional[int] = None) -> Optional[ManifestInfo]:
+    """Safely parses package/dependency manifest files with strict resource bounds."""
     name = file_path.name.lower()
+    try:
+        file_size = file_path.stat().st_size
+    except Exception:
+        file_size = 0
+
+    max_read = file_size
+    if config is not None:
+        max_read = min(max_read, config.max_bytes_per_file)
+    if remaining_budget is not None:
+        max_read = min(max_read, remaining_budget)
+
+    # Enforce parser cannot read beyond safety bounds
+    try:
+        with open(file_path, "rb") as f:
+            raw_bytes = f.read(max_read)
+        content = raw_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        content = ""
+
     if name == "package.json":
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
         data = json.loads(content)
         deps = list(data.get("dependencies", {}).keys()) if isinstance(data.get("dependencies"), dict) else []
         dev_deps = list(data.get("devDependencies", {}).keys()) if isinstance(data.get("devDependencies"), dict) else []
         return ManifestInfo(
             ecosystem="npm",
             file=rel_path_str,
-            dependencies=deps,
-            dev_dependencies=dev_deps
+            dependencies=deps[:500],
+            dev_dependencies=dev_deps[:500]
         )
     elif name in ("requirements.txt", "requirements-dev.txt"):
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
         deps = []
         for line in content.splitlines():
             line = line.strip()
             if line and not line.startswith("#") and not line.startswith("-"):
-                # Extract package name before any operator (==, >=, etc.)
                 pkg = re.split(r"[=<>;~\s]", line)[0].strip()
                 if pkg:
                     deps.append(pkg)
         return ManifestInfo(
             ecosystem="pip",
             file=rel_path_str,
-            dependencies=deps
+            dependencies=deps[:500]
         )
     elif name == "pyproject.toml":
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
         deps = []
         try:
             import tomllib
             data = tomllib.loads(content)
-            # PEP 621 [project] dependencies
             proj_deps = data.get("project", {}).get("dependencies", [])
             for d in proj_deps:
                 pkg = re.split(r"[=<>;~\s\[]", d)[0].strip()
                 if pkg:
                     deps.append(pkg)
-            # Poetry [tool.poetry.dependencies]
             poetry_deps = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
             for k in poetry_deps.keys():
                 if k.lower() != "python":
                     deps.append(k)
         except Exception:
-            # Fallback parsing
             in_deps = False
             for line in content.splitlines():
                 if "dependencies" in line:
@@ -173,10 +185,9 @@ def parse_manifest_file(file_path: Path, rel_path_str: str) -> Optional[Manifest
         return ManifestInfo(
             ecosystem="pip/poetry/flit",
             file=rel_path_str,
-            dependencies=deps
+            dependencies=deps[:500]
         )
     elif name == "cargo.toml":
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
         deps = []
         in_deps = False
         for line in content.splitlines():
@@ -193,10 +204,9 @@ def parse_manifest_file(file_path: Path, rel_path_str: str) -> Optional[Manifest
         return ManifestInfo(
             ecosystem="cargo",
             file=rel_path_str,
-            dependencies=deps
+            dependencies=deps[:500]
         )
     elif name == "go.mod":
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
         deps = []
         in_require_block = False
         for line in content.splitlines():
@@ -222,7 +232,7 @@ def parse_manifest_file(file_path: Path, rel_path_str: str) -> Optional[Manifest
         return ManifestInfo(
             ecosystem="go",
             file=rel_path_str,
-            dependencies=deps
+            dependencies=deps[:500]
         )
     return None
 

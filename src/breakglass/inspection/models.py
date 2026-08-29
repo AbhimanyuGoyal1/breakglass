@@ -36,8 +36,8 @@ class InspectionLimits:
             raise ValueError("max_duration_seconds must be a finite positive number")
         if not isinstance(self.max_findings, int) or self.max_findings <= 0 or isinstance(self.max_findings, bool):
             raise ValueError("max_findings must be a positive integer")
-        if not isinstance(self.max_serialized_report_bytes, int) or self.max_serialized_report_bytes <= 0 or isinstance(self.max_serialized_report_bytes, bool):
-            raise ValueError("max_serialized_report_bytes must be a positive integer")
+        if not isinstance(self.max_serialized_report_bytes, int) or self.max_serialized_report_bytes < 1024 or isinstance(self.max_serialized_report_bytes, bool):
+            raise ValueError("max_serialized_report_bytes must be an integer and at least 1024 bytes")
         if not isinstance(self.max_path_length, int) or self.max_path_length <= 0 or isinstance(self.max_path_length, bool):
             raise ValueError("max_path_length must be a positive integer")
         if not isinstance(self.max_text_length, int) or self.max_text_length <= 0 or isinstance(self.max_text_length, bool):
@@ -99,8 +99,8 @@ class SecurityIndicator:
         if not isinstance(evidence, str):
             raise ValueError("Field 'evidence' must be a string")
         confidence = data.get("confidence", 0.8)
-        if not isinstance(confidence, (int, float)):
-            raise ValueError("Field 'confidence' must be a float")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not (0.0 <= confidence <= 1.0):
+            raise ValueError("Field 'confidence' must be a finite float between 0.0 and 1.0")
 
         return cls(
             category=data["category"],
@@ -142,8 +142,8 @@ class RouteCandidate:
         if "line" not in data or not isinstance(data["line"], int) or data["line"] <= 0 or isinstance(data["line"], bool):
             raise ValueError("Field 'line' must be a positive integer")
         confidence = data.get("confidence", 0.85)
-        if not isinstance(confidence, (int, float)):
-            raise ValueError("Field 'confidence' must be a float")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not (0.0 <= confidence <= 1.0):
+            raise ValueError("Field 'confidence' must be a finite float between 0.0 and 1.0")
 
         return cls(
             file=data["file"],
@@ -186,8 +186,8 @@ class EntryPointCandidate:
         if line is not None and (not isinstance(line, int) or line < 0 or isinstance(line, bool)):
             raise ValueError("Field 'line' must be a non-negative integer or None")
         confidence = data.get("confidence", 0.8)
-        if not isinstance(confidence, (int, float)):
-            raise ValueError("Field 'confidence' must be a float")
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence) or not (0.0 <= confidence <= 1.0):
+            raise ValueError("Field 'confidence' must be a finite float between 0.0 and 1.0")
 
         return cls(
             file=data["file"],
@@ -351,7 +351,7 @@ class RepositoryReport:
         }
 
     def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
+        return json.dumps(self.to_dict(), indent=indent, allow_nan=False)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RepositoryReport":

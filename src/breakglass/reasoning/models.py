@@ -68,7 +68,7 @@ class ReasoningReport:
         }
 
     def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
+        return json.dumps(self.to_dict(), indent=indent, allow_nan=False)
 
 
 def generate_hypothesis_id(category: str, identity: Dict[str, Any], is_llm: bool = False) -> str:

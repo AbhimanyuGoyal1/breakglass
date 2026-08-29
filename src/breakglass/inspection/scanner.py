@@ -243,6 +243,8 @@ class RepositoryInspectionEngine:
             return path
 
         limit_reached_reason = None
+        visited_dirs = 0
+        dirs_limit_reached = False
 
         # 4. Directory and File Traversal using os.walk
         for root, dirs, files in os.walk(repo_root, followlinks=False):
@@ -252,6 +254,8 @@ class RepositoryInspectionEngine:
                 break
 
             current_dir = Path(root)
+            if current_dir != Path(repo_root):
+                visited_dirs += 1
 
             # A. Canonicalize and verify current directory containment
             if not _is_contained_in(repo_root, current_dir):
@@ -265,9 +269,10 @@ class RepositoryInspectionEngine:
                 dirs[:] = []  # Do not descend
                 continue
 
-            # B. Check directory limits
-            if total_directories >= self.config.max_directories:
-                limit_reached_reason = f"Directories limit of {self.config.max_directories} reached"
+            # B. Check directory limits (Qodo 8: directories are counted when actually visited)
+            if visited_dirs >= self.config.max_directories:
+                dirs_limit_reached = True
+                dirs[:] = []
                 break
 
             # C. Filter, inspect, and prune directory list
@@ -281,7 +286,7 @@ class RepositoryInspectionEngine:
 
                 try:
                     rel_dir = dir_path.relative_to(repo_root)
-                    rel_dir_str = limit_path(str(rel_dir).replace("\\", "/"))
+                    rel_dir_str = str(rel_dir).replace("\\", "/")
                 except ValueError:
                     errors.append(
                         InspectionError(
@@ -292,14 +297,25 @@ class RepositoryInspectionEngine:
                     )
                     continue
 
-                # Directory symlink check
+                # Check path length limits before descent. Prefer rejecting overlong paths to prevent ambiguous identity (Qodo 4)
+                if len(rel_dir_str) > self.config.max_path_length:
+                    errors.append(
+                        InspectionError(
+                            file=limit_path(rel_dir_str),
+                            message="Directory relative path exceeds max_path_length limit",
+                            error_type="path_too_long"
+                        )
+                    )
+                    continue
+
+                # Directory symlink check using full path
                 if dir_path.is_symlink():
                     try:
                         resolved_dir = dir_path.resolve()
                         if not _is_contained_in(repo_root, resolved_dir):
                             errors.append(
                                 InspectionError(
-                                    file=rel_dir_str,
+                                    file=limit_path(rel_dir_str),
                                     message=f"Directory symlink points outside repository: {resolved_dir}",
                                     error_type="symlink_out_of_bounds"
                                 )
@@ -308,7 +324,7 @@ class RepositoryInspectionEngine:
                     except Exception as e:
                         errors.append(
                             InspectionError(
-                                file=rel_dir_str,
+                                file=limit_path(rel_dir_str),
                                 message=f"Failed to resolve directory symlink: {str(e)}",
                                 error_type="symlink_error"
                             )
@@ -321,9 +337,13 @@ class RepositoryInspectionEngine:
 
                 valid_dirs.append(d)
 
-            # Apply pruned dirs list to control os.walk descent
+            # Apply pruned dirs list to control os.walk descent and cap dynamically to remaining budget (Qodo 8)
+            remaining_budget = self.config.max_directories - visited_dirs
+            if len(valid_dirs) > remaining_budget:
+                valid_dirs = valid_dirs[:remaining_budget]
+                dirs_limit_reached = True
+
             dirs[:] = valid_dirs
-            total_directories += len(dirs)
 
             # D. File handling
             for filename in sorted(files):
@@ -335,7 +355,7 @@ class RepositoryInspectionEngine:
 
                 try:
                     rel_path = file_path.relative_to(repo_root)
-                    rel_path_str = limit_path(str(rel_path).replace("\\", "/"))
+                    rel_path_str = str(rel_path).replace("\\", "/")
                 except ValueError:
                     errors.append(
                         InspectionError(
@@ -346,14 +366,25 @@ class RepositoryInspectionEngine:
                     )
                     continue
 
-                # Symlink validation
+                # Check path length limits before scanning. Prefer rejecting overlong paths to prevent ambiguous identity (Qodo 4)
+                if len(rel_path_str) > self.config.max_path_length:
+                    errors.append(
+                        InspectionError(
+                            file=limit_path(rel_path_str),
+                            message="File relative path exceeds max_path_length limit",
+                            error_type="path_too_long"
+                        )
+                    )
+                    continue
+
+                # Symlink validation using full path
                 if file_path.is_symlink():
                     try:
                         resolved_symlink = file_path.resolve()
                         if not _is_contained_in(repo_root, resolved_symlink):
                             errors.append(
                                 InspectionError(
-                                    file=rel_path_str,
+                                    file=limit_path(rel_path_str),
                                     message=f"Symlink points outside repository: {resolved_symlink}",
                                     error_type="symlink_out_of_bounds"
                                 )
@@ -362,14 +393,14 @@ class RepositoryInspectionEngine:
                     except Exception as e:
                         errors.append(
                             InspectionError(
-                                file=rel_path_str,
+                                file=limit_path(rel_path_str),
                                 message=f"Failed to resolve symlink: {str(e)}",
-                                error_type="symlink_error"
+                                decline_type="symlink_error"
                             )
                         )
                         continue
 
-                # Ignore checks
+                # Ignore checks on full path
                 if _is_component_ignored(rel_path_str, self.custom_exclusions) or _is_path_ignored(rel_path_str, gitignore_rules, is_dir=False):
                     continue
 
@@ -380,7 +411,7 @@ class RepositoryInspectionEngine:
 
                 total_files += 1
 
-                # Classify file
+                # Classify file using full relative path
                 category = classify_file(filename, rel_path_str)
 
                 # Track language and classification metrics
@@ -389,29 +420,38 @@ class RepositoryInspectionEngine:
                     languages[lang] = languages.get(lang, 0) + 1
 
                 if category == "tests":
-                    test_files.append(rel_path_str)
+                    test_files.append(limit_path(rel_path_str))
                 elif category == "infrastructure_config":
                     classes = check_is_config_or_infra(rel_path_str)
                     if classes["is_docker"]:
-                        docker_configs.append(rel_path_str)
+                        docker_configs.append(limit_path(rel_path_str))
                     if classes["is_infra"]:
-                        infrastructure_configs.append(rel_path_str)
+                        infrastructure_configs.append(limit_path(rel_path_str))
                 elif category == "cicd_config":
-                    cicd_configs.append(rel_path_str)
+                    cicd_configs.append(limit_path(rel_path_str))
                 elif category == "configuration":
-                    config_files.append(rel_path_str)
+                    config_files.append(limit_path(rel_path_str))
 
-                # Parse manifest dependencies
+                # Parse manifest dependencies under resource limits (Qodo 10)
                 if category == "dependency_manifests":
                     try:
-                        manifest_info = parse_manifest_file(file_path, rel_path_str)
+                        file_size = file_path.stat().st_size
+                        remaining_budget = self.config.max_total_bytes - total_bytes_inspected
+                        if file_size > self.config.max_file_size:
+                            raise ValueError(f"Manifest size ({file_size} bytes) exceeds limit ({self.config.max_file_size} bytes)")
+                        if remaining_budget <= 0:
+                            raise ValueError("Aggregate size limit exceeded before parsing manifest")
+
+                        manifest_info = parse_manifest_file(file_path, limit_path(rel_path_str), self.config, remaining_budget)
                         if manifest_info:
                             manifests.append(manifest_info)
                             ecosystems.add(manifest_info.ecosystem)
+                            bytes_read = min(file_size, self.config.max_bytes_per_file, remaining_budget)
+                            total_bytes_inspected += bytes_read
                     except Exception as e:
                         errors.append(
                             InspectionError(
-                                file=rel_path_str,
+                                file=limit_path(rel_path_str),
                                 message=redact_secrets(f"Manifest parse failed: {str(e)}"),
                                 error_type="manifest_parse_error"
                             )
@@ -423,7 +463,7 @@ class RepositoryInspectionEngine:
                 except Exception as e:
                     errors.append(
                         InspectionError(
-                            file=rel_path_str,
+                            file=limit_path(rel_path_str),
                             message=redact_secrets(f"Could not stat file: {str(e)}"),
                             error_type="stat_error"
                         )
@@ -433,7 +473,7 @@ class RepositoryInspectionEngine:
                 if file_size > self.config.max_file_size:
                     errors.append(
                         InspectionError(
-                            file=rel_path_str,
+                            file=limit_path(rel_path_str),
                             message=f"File size ({file_size} bytes) exceeds safety scan limit ({self.config.max_file_size} bytes)",
                             error_type="file_size_exceeded"
                         )
@@ -444,23 +484,31 @@ class RepositoryInspectionEngine:
                 if category == "binary" or _is_binary_file(file_path):
                     continue
 
-                # Check aggregate bytes limit before reading
-                if total_bytes_inspected >= self.config.max_total_bytes:
+                # Check aggregate bytes limit before reading (Qodo 11)
+                remaining_budget = self.config.max_total_bytes - total_bytes_inspected
+                if remaining_budget <= 0:
                     errors.append(
                         InspectionError(
-                            file=rel_path_str,
+                            file=limit_path(rel_path_str),
                             message="Content scan skipped: aggregate size limit exceeded",
                             error_type="total_bytes_exceeded"
                         )
                     )
                     continue
 
-                # Content scanning under bounds
-                try:
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                        content_chunk = f.read(self.config.max_bytes_per_file)
+                # Content scanning under bounds (Qodo 11)
+                # Read at most min(max_bytes_per_file, remaining_budget) bytes in binary mode rb to prevent encoding overshoot
+                max_bytes_to_read = min(self.config.max_bytes_per_file, remaining_budget)
 
-                    total_bytes_inspected += len(content_chunk.encode("utf-8"))
+                try:
+                    with open(file_path, "rb") as f:
+                        raw_bytes = f.read(max_bytes_to_read)
+
+                    actual_bytes_read = len(raw_bytes)
+                    total_bytes_inspected += actual_bytes_read
+
+                    # Decode safely ignoring incomplete sequences
+                    content_chunk = raw_bytes.decode("utf-8", errors="ignore")
 
                     lines = content_chunk.splitlines()
                     for line_num, line in enumerate(lines, start=1):
@@ -468,7 +516,7 @@ class RepositoryInspectionEngine:
                             break
 
                         # 1. Security Indicators
-                        found_indicators = scan_line_for_indicators(line, line_num, rel_path_str)
+                        found_indicators = scan_line_for_indicators(line, line_num, limit_path(rel_path_str))
                         for ind in found_indicators:
                             if len(entry_points) + len(routes) + len(security_indicators) >= self.config.max_findings:
                                 if not limit_reached_reason:
@@ -479,7 +527,7 @@ class RepositoryInspectionEngine:
                             security_indicators.append(ind)
 
                         # 2. HTTP Route candidates
-                        found_routes = scan_line_for_routes(line, line_num, rel_path_str)
+                        found_routes = scan_line_for_routes(line, line_num, limit_path(rel_path_str))
                         for rt in found_routes:
                             if len(entry_points) + len(routes) + len(security_indicators) >= self.config.max_findings:
                                 if not limit_reached_reason:
@@ -491,7 +539,7 @@ class RepositoryInspectionEngine:
                             routes.append(rt)
 
                         # 3. Entry point candidates
-                        ep = scan_line_for_entry_points(line, line_num, rel_path_str)
+                        ep = scan_line_for_entry_points(line, line_num, limit_path(rel_path_str))
                         if ep:
                             if len(entry_points) + len(routes) + len(security_indicators) >= self.config.max_findings:
                                 if not limit_reached_reason:
@@ -504,7 +552,7 @@ class RepositoryInspectionEngine:
                 except Exception as e:
                     errors.append(
                         InspectionError(
-                            file=rel_path_str,
+                            file=limit_path(rel_path_str),
                             message=redact_secrets(f"Error reading file content: {str(e)}"),
                             error_type="read_error"
                         )
@@ -522,6 +570,14 @@ class RepositoryInspectionEngine:
                     error_type="resource_limit_exceeded"
                 )
             )
+        elif dirs_limit_reached:
+            errors.append(
+                InspectionError(
+                    file="",
+                    message=f"Directories limit of {self.config.max_directories} reached",
+                    error_type="resource_limit_exceeded"
+                )
+            )
 
         # Detect frameworks from manifests
         frameworks = detect_frameworks_from_manifests(manifests)
@@ -536,7 +592,7 @@ class RepositoryInspectionEngine:
         summary = RepositorySummary(
             root=repo_root_str,
             total_files=total_files,
-            total_directories=total_directories,
+            total_directories=visited_dirs,
             languages=languages,
             frameworks=frameworks,
             ecosystems=sorted(list(ecosystems)),
@@ -556,7 +612,7 @@ class RepositoryInspectionEngine:
             errors=errors
         )
 
-        # 5. Serialized report size check & incremental pruning
+        # 5. Serialized report size check & incremental pruning (Qodo 7)
         try:
             serialized_len = len(report.to_json().encode("utf-8"))
             if serialized_len > self.config.max_serialized_report_bytes:
@@ -581,6 +637,35 @@ class RepositoryInspectionEngine:
                     elif report.entry_points:
                         report.entry_points.pop()
                         pruned = True
+                    elif report.manifests:
+                        report.manifests.pop()
+                        pruned = True
+                    elif report.repository.config_files:
+                        report.repository.config_files.pop()
+                        pruned = True
+                    elif report.repository.docker_configs:
+                        report.repository.docker_configs.pop()
+                        pruned = True
+                    elif report.repository.cicd_configs:
+                        report.repository.cicd_configs.pop()
+                        pruned = True
+                    elif report.repository.infrastructure_configs:
+                        report.repository.infrastructure_configs.pop()
+                        pruned = True
+                    elif report.repository.test_files:
+                        report.repository.test_files.pop()
+                        pruned = True
+                    elif report.repository.languages:
+                        if report.repository.languages:
+                            k = next(iter(report.repository.languages))
+                            report.repository.languages.pop(k)
+                            pruned = True
+                    elif report.repository.frameworks:
+                        report.repository.frameworks.pop()
+                        pruned = True
+                    elif report.repository.ecosystems:
+                        report.repository.ecosystems.pop()
+                        pruned = True
                     elif len(report.errors) > 1:
                         report.errors.pop(0)
                         pruned = True
@@ -589,6 +674,28 @@ class RepositoryInspectionEngine:
                         break
 
                     serialized_len = len(report.to_json().encode("utf-8"))
+
+                # If still over limit, fallback to deliberately minimal representation
+                if serialized_len > self.config.max_serialized_report_bytes:
+                    report.security_indicators = []
+                    report.routes = []
+                    report.entry_points = []
+                    report.manifests = []
+                    report.repository.config_files = []
+                    report.repository.docker_configs = []
+                    report.repository.cicd_configs = []
+                    report.repository.infrastructure_configs = []
+                    report.repository.test_files = []
+                    report.repository.languages = {}
+                    report.repository.frameworks = []
+                    report.repository.ecosystems = []
+                    report.errors = [
+                        InspectionError(
+                            file="",
+                            message="Report size exceeded limit. All collections cleared.",
+                            error_type="serialized_report_size_exceeded"
+                        )
+                    ]
         except Exception:
             pass
 

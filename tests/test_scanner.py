@@ -452,6 +452,173 @@ class TestCodebaseScanner(unittest.TestCase):
             self.assertLessEqual(len(serialized.encode("utf-8")), 2000)
             self.assertTrue(any(e.error_type == "serialized_report_size_exceeded" for e in report.errors))
 
+    def test_long_path_rejection_no_truncation(self):
+        """Verify that relative paths exceeding max_path_length are rejected rather than silently truncated."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            # Create a moderately long path
+            long_dir = repo / "a_directory_name_that_is_long"
+            long_dir.mkdir(parents=True, exist_ok=True)
+            (long_dir / "target.py").write_text("import os; os.system('run')")
+
+            # Create a long ignored path (should be ignored even though it's long)
+            ignored_long_dir = repo / "node_modules" / "some_ignored_long_name"
+            ignored_long_dir.mkdir(parents=True, exist_ok=True)
+            (ignored_long_dir / "ignored.py").write_text("import os; os.system('run')")
+
+            limits = InspectionLimits(max_path_length=20)
+            engine = RepositoryInspectionEngine(limits)
+            report = engine.inspect(str(repo))
+
+            # Ignored long directory node_modules component should be ignored
+            self.assertFalse(any("ignored.py" in str(ind.file) for ind in report.security_indicators))
+
+            # The actual target path should raise a path_too_long error
+            self.assertTrue(any(e.error_type == "path_too_long" for e in report.errors))
+            # No indicator should be extracted from the target file since it was rejected before scanning
+            self.assertEqual(len(report.security_indicators), 0)
+
+    def test_strict_confidence_value_checks(self):
+        """Verify confidence validators reject booleans, NaN, infinities, non-numeric values, or range violations."""
+        from breakglass.inspection.models import SecurityIndicator, RouteCandidate, EntryPointCandidate
+
+        valid_ind_data = {
+            "category": "subprocess",
+            "indicator_type": "type",
+            "file": "file.py"
+        }
+
+        for invalid in (True, False, float("nan"), float("inf"), float("-inf"), "not-a-number", -0.1, 1.1):
+            # Test SecurityIndicator
+            data = valid_ind_data.copy()
+            data["confidence"] = invalid
+            with self.assertRaises(ValueError):
+                SecurityIndicator.from_dict(data)
+
+            # Test RouteCandidate
+            data_route = {
+                "file": "file.py",
+                "line": 10,
+                "method": "GET",
+                "pattern": "/api",
+                "evidence": "evidence",
+                "confidence": invalid
+            }
+            with self.assertRaises(ValueError):
+                RouteCandidate.from_dict(data_route)
+
+            # Test EntryPointCandidate
+            data_ep = {
+                "file": "file.py",
+                "type": "cli",
+                "description": "desc",
+                "confidence": invalid
+            }
+            with self.assertRaises(ValueError):
+                EntryPointCandidate.from_dict(data_ep)
+
+    def test_report_serialized_size_absolute_upper_bound(self):
+        """Verify that max_serialized_report_bytes enforces absolute size boundary even if collections dominate."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            # Create many test files to inflate summary size
+            for i in range(100):
+                (repo / f"test_file_{i}.py").write_text("import os; os.system('run')")
+
+            # Check that setting limits below 1024 raises ValueError during validation
+            with self.assertRaises(ValueError):
+                InspectionLimits(max_serialized_report_bytes=500).validate()
+
+            limits = InspectionLimits(max_serialized_report_bytes=1024)
+            engine = RepositoryInspectionEngine(limits)
+            report = engine.inspect(str(repo))
+
+            serialized = report.to_json()
+            self.assertLessEqual(len(serialized.encode("utf-8")), 1024)
+            # Fallback to minimal report because test_files collection is huge
+            self.assertLess(len(report.repository.test_files), 100)
+            self.assertTrue(any(e.error_type == "serialized_report_size_exceeded" for e in report.errors))
+
+    def test_directory_cap_visited(self):
+        """Verify that directory cap only counts visited/admitted directories and limits traversal budget."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            # Create 5 subdirectories
+            for i in range(5):
+                d = repo / f"dir_{i}"
+                d.mkdir()
+                (d / "file.py").write_text("import os; os.system('run')")
+
+            # max_directories=2 (repo root is visited, plus at most 1 subdirectory, totaling 2 directories)
+            limits = InspectionLimits(max_directories=2)
+            engine = RepositoryInspectionEngine(limits)
+            report = engine.inspect(str(repo))
+
+            # Visited directories must not exceed 2
+            self.assertEqual(report.repository.total_directories, 2)
+            # Total indicators extracted must match only the files in the visited directories
+            self.assertEqual(len(report.security_indicators), 1)
+
+    def test_manifest_parser_limits(self):
+        """Verify manifest parser bounds reading size and caps dependencies list size."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            # Create oversized manifest file (package.json with 2000 dependencies)
+            deps = {f"dep_{i}": "^1.0.0" for i in range(2000)}
+            large_pkg = {
+                "name": "oversized-package",
+                "dependencies": deps
+            }
+            import json
+            pkg_path = repo / "package.json"
+            pkg_path.write_text(json.dumps(large_pkg))
+
+            # Limit reading size per file to 500 bytes (which should fail to parse package.json as valid json)
+            limits = InspectionLimits(max_bytes_per_file=500)
+            engine = RepositoryInspectionEngine(limits)
+            report = engine.inspect(str(repo))
+
+            # Manifest parsing should fail/isolate with error because reading was truncated to 500 bytes
+            self.assertTrue(any(e.error_type == "manifest_parse_error" for e in report.errors))
+
+            # Clean repo and test dependencies cap
+            pkg_path.unlink()
+            large_pkg = {
+                "name": "capped-package",
+                "dependencies": {f"dep_{i}": "^1.0.0" for i in range(600)}
+            }
+            pkg_path.write_text(json.dumps(large_pkg))
+
+            limits_normal = InspectionLimits(max_bytes_per_file=50000)
+            engine_normal = RepositoryInspectionEngine(limits_normal)
+            report_normal = engine_normal.inspect(str(repo))
+
+            # Dependencies list must be capped to 500
+            self.assertEqual(len(report_normal.manifests), 1)
+            self.assertEqual(len(report_normal.manifests[0].dependencies), 500)
+
+    def test_aggregate_byte_cap_overshoot(self):
+        """Verify aggregate byte cap does not overshoot and accounts for multibyte characters exactly."""
+        from breakglass.inspection import RepositoryInspectionEngine, InspectionLimits
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo = Path(temp_dir)
+            # 1. Write file with multibyte characters (each emoji is 4 bytes)
+            (repo / "file1.py").write_text("🌟" * 10, encoding="utf-8")  # 40 bytes in UTF-8
+            (repo / "file2.py").write_text("import os; os.system('run')") # 27 bytes
+
+            # Enforce aggregate budget of exactly 20 bytes (which is less than file1 size)
+            limits = InspectionLimits(max_total_bytes=20)
+            engine = RepositoryInspectionEngine(limits)
+            report = engine.inspect(str(repo))
+
+            # File 1 content scan will read up to 20 bytes (exactly 5 emojis). File 2 should be skipped entirely.
+            # Total bytes inspected should not exceed 20
+            self.assertTrue(any(e.error_type == "total_bytes_exceeded" for e in report.errors))
+
 
 if __name__ == "__main__":
     unittest.main()

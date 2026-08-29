@@ -1,9 +1,11 @@
+from __future__ import annotations
 import os
 import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference, generate_hypothesis_id
 from breakglass.inspection.scanner import _is_contained_in
+from breakglass.inspection.models import RepositoryReport
 
 def validate_and_create_evidence_ref(
     ref_type: str,

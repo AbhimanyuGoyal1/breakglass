@@ -28,12 +28,30 @@ class SecurityHypothesisGenerator:
         except Exception as e:
             errors.append(f"Hypothesis generation encountered unexpected exception: {str(e)}")
 
-        # 2. Deduplicate hypotheses using a semantic fingerprint
+        # 2. Apply safe per-candidate field/resource bounds
+        bounded_candidates: List[SecurityHypothesis] = []
+        for hyp in candidates:
+            if time.perf_counter() - start_time > self.config.generation_timeout_seconds:
+                timeout_reached = True
+                break
+            try:
+                # Enforce max evidence references per hypothesis
+                if len(hyp.evidence_references) > self.config.max_evidence_per_hypothesis:
+                    hyp.evidence_references = hyp.evidence_references[:self.config.max_evidence_per_hypothesis]
+
+                # Enforce max description length
+                if len(hyp.description) > self.config.max_description_length:
+                    hyp.description = hyp.description[:self.config.max_description_length] + "... [TRUNCATED]"
+
+                bounded_candidates.append(hyp)
+            except Exception as e:
+                errors.append(f"Failed to bound candidate hypothesis fields: {str(e)}")
+
+        # 3. Deduplicate candidates using a semantic fingerprint
         deduplicated: List[SecurityHypothesis] = []
         seen_fingerprints = set()
 
-        for hyp in candidates:
-            # Check timeout budget
+        for hyp in bounded_candidates:
             if time.perf_counter() - start_time > self.config.generation_timeout_seconds:
                 timeout_reached = True
                 break
@@ -50,14 +68,22 @@ class SecurityHypothesisGenerator:
                     seen_fingerprints.add(fingerprint)
                     deduplicated.append(hyp)
             except Exception as e:
-                # Catch malformed candidates safely
-                errors.append(f"Failed to process candidate hypothesis: {str(e)}")
+                errors.append(f"Failed to process candidate hypothesis deduplication: {str(e)}")
 
-        # 3. Limit-bound individual hypothesis attributes
-        bounded_candidates: List[SecurityHypothesis] = []
+        # 4. Rank the complete deduplicated and bounded candidate set
+        ranked_candidates: List[SecurityHypothesis] = []
+        try:
+            ranked_candidates = rank_hypotheses_deterministically(deduplicated)
+        except Exception as e:
+            errors.append(f"Hypothesis ranking failed: {str(e)}")
+            ranked_candidates = deduplicated
+
+        # 5. Apply per-category and global admission limits in ranked order
+        final_list: List[SecurityHypothesis] = []
         category_counts: Dict[str, int] = {}
+        total_bytes = 0
 
-        for hyp in deduplicated:
+        for hyp in ranked_candidates:
             if time.perf_counter() - start_time > self.config.generation_timeout_seconds:
                 timeout_reached = True
                 break
@@ -68,53 +94,24 @@ class SecurityHypothesisGenerator:
                 cat_count = category_counts.get(cat, 0)
                 if cat_count >= self.config.max_hypotheses_per_category:
                     continue
-                
-                # Enforce max evidence references per hypothesis
-                if len(hyp.evidence_references) > self.config.max_evidence_per_hypothesis:
-                    hyp.evidence_references = hyp.evidence_references[:self.config.max_evidence_per_hypothesis]
-
-                # Enforce max description length
-                if len(hyp.description) > self.config.max_description_length:
-                    hyp.description = hyp.description[:self.config.max_description_length] + "... [TRUNCATED]"
-
-                bounded_candidates.append(hyp)
-                category_counts[cat] = cat_count + 1
 
                 # Enforce max total hypotheses limit
-                if len(bounded_candidates) >= self.config.max_hypotheses:
+                if len(final_list) >= self.config.max_hypotheses:
                     break
-            except Exception as e:
-                errors.append(f"Failed to bound hypothesis: {str(e)}")
 
-        # 4. Rank candidates deterministically
-        ranked_candidates: List[SecurityHypothesis] = []
-        try:
-            ranked_candidates = rank_hypotheses_deterministically(bounded_candidates)
-        except Exception as e:
-            errors.append(f"Hypothesis ranking failed: {str(e)}")
-            ranked_candidates = bounded_candidates
-
-        # 5. Enforce max total generated hypothesis bytes
-        final_list: List[SecurityHypothesis] = []
-        total_bytes = 0
-        
-        for hyp in ranked_candidates:
-            if time.perf_counter() - start_time > self.config.generation_timeout_seconds:
-                timeout_reached = True
-                break
-
-            try:
+                # Enforce max total generated hypothesis bytes
                 hyp_dict = hyp.to_dict()
                 hyp_bytes = len(json.dumps(hyp_dict).encode("utf-8"))
                 
                 if total_bytes + hyp_bytes <= self.config.max_total_hypothesis_bytes:
                     final_list.append(hyp)
                     total_bytes += hyp_bytes
+                    category_counts[cat] = cat_count + 1
                 else:
                     # Exceeded max total hypothesis bytes, stop admission
                     break
             except Exception as e:
-                errors.append(f"Failed to check size bound for hypothesis: {str(e)}")
+                errors.append(f"Failed to apply admission limits for hypothesis: {str(e)}")
 
         if timeout_reached:
             errors.append(f"Hypothesis generation reached timeout budget of {self.config.generation_timeout_seconds}s")

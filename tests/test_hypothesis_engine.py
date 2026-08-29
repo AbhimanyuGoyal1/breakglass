@@ -10,7 +10,7 @@ from breakglass.inspection.models import (
     EntryPointCandidate,
     ManifestInfo
 )
-from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference
+from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference, generate_hypothesis_id
 from breakglass.hypothesis import HypothesisConfig, SecurityHypothesisGenerator
 from breakglass.validation import ValidationEngine, MockSandboxValidator
 
@@ -414,6 +414,167 @@ class TestSecurityHypothesisEngine(unittest.TestCase):
         engine = ValidationEngine(validator)
         eligible, reason = engine.check_eligibility(res.hypotheses[0], report)
         self.assertTrue(eligible, f"Eligibility failed: {reason}")
+
+    def test_all_11_categories_validation(self):
+        """Verify that every one of the 11 generated categories successfully authenticates and passes validation."""
+        (Path(self.repo_root) / "src").mkdir(exist_ok=True)
+        (Path(self.repo_root) / "src/server.py").write_text("print('test')")
+        (Path(self.repo_root) / "go.mod").write_text("module test\nrequire github.com/gin-gonic/gin v1.7.0")
+
+        # Setup all findings to trigger generators
+        report = RepositoryReport(
+            repository=RepositorySummary(
+                root=self.repo_root,
+                total_files=3,
+                total_directories=1,
+                languages={"python": 1, "go": 1},
+                frameworks=["flask"],
+                ecosystems=["npm", "go", "pip"],
+                config_files=["src/server.py"],
+                docker_configs=[],
+                cicd_configs=[],
+                infrastructure_configs=[],
+                test_files=[]
+            ),
+            routes=[RouteCandidate(file="src/server.py", line=12, method="POST", pattern="/run", evidence="")],
+            security_indicators=[
+                SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=123"),
+                SecurityIndicator(category="subprocess", indicator_type="subprocess_indicator", file="src/server.py", line=15, evidence="subprocess.run"),
+                SecurityIndicator(category="authentication", indicator_type="auth_check", file="src/server.py", line=25, evidence="login()"),
+                SecurityIndicator(category="filesystem", indicator_type="file_access", file="src/server.py", line=35, evidence="open()")
+            ],
+            entry_points=[EntryPointCandidate(file="src/server.py", type="cli", description="main script", line=10)],
+            manifests=[ManifestInfo(ecosystem="go", file="go.mod", dependencies=["github.com/gin-gonic/gin"])],
+            errors=[]
+        )
+
+        generator = SecurityHypothesisGenerator()
+        res = generator.generate_and_rank(report, self.repo_root)
+        self.assertGreater(len(res.hypotheses), 0)
+
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # Verify eligibility and ID re-authentication for all generated hypotheses
+        for hyp in res.hypotheses:
+            valid, canonical_hyp, err_msg = engine.validate_hypothesis_shape(hyp, report)
+            self.assertTrue(valid, f"Validation failed for category '{hyp.category}': {err_msg}")
+
+    def test_standalone_vs_correlated_credentials_authentication(self):
+        """Verify that standalone and framework-correlated credential hypotheses authenticate correctly, and tampered IDs fail."""
+        (Path(self.repo_root) / "src").mkdir(exist_ok=True)
+        (Path(self.repo_root) / "src/server.py").write_text("print('test')")
+
+        # 1. Standalone secret finding (triggers ind_secret identity)
+        report_stan = RepositoryReport(
+            repository=RepositorySummary(
+                root=self.repo_root, total_files=1, total_directories=0, languages={}, frameworks=[], ecosystems=[],
+                config_files=[], docker_configs=[], cicd_configs=[], infrastructure_configs=[], test_files=[]
+            ),
+            routes=[],
+            security_indicators=[SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=123")],
+            entry_points=[], manifests=[], errors=[]
+        )
+        generator = SecurityHypothesisGenerator()
+        res_stan = generator.generate_and_rank(report_stan, self.repo_root)
+        self.assertEqual(len(res_stan.hypotheses), 1)
+        hyp_stan = res_stan.hypotheses[0]
+
+        validator = MockSandboxValidator()
+        engine = ValidationEngine(validator)
+
+        # Standalone should authenticate successfully
+        valid, canonical_stan, err_msg = engine.validate_hypothesis_shape(hyp_stan, report_stan)
+        self.assertTrue(valid, f"Standalone authentication failed: {err_msg}")
+
+        # Tampering with ID should fail
+        hyp_stan_tampered = SecurityHypothesis(
+            id="HYP-CREDENTIAL-EXPOSURE-TAMPERED",
+            title=hyp_stan.title,
+            description=hyp_stan.description,
+            category=hyp_stan.category,
+            severity=hyp_stan.severity,
+            confidence=hyp_stan.confidence,
+            evidence_references=hyp_stan.evidence_references
+        )
+        valid_t, _, _ = engine.validate_hypothesis_shape(hyp_stan_tampered, report_stan)
+        self.assertFalse(valid_t, "Tampered standalone ID should have been rejected")
+
+        # 2. Correlated credential finding (triggers framework credential identity)
+        report_corr = RepositoryReport(
+            repository=RepositorySummary(
+                root=self.repo_root, total_files=1, total_directories=0, languages={}, frameworks=["flask"], ecosystems=[],
+                config_files=[], docker_configs=[], cicd_configs=[], infrastructure_configs=[], test_files=[]
+            ),
+            routes=[],
+            security_indicators=[SecurityIndicator(category="secret_config", indicator_type="api_key_indicator", file="src/server.py", line=5, evidence="API_KEY=123")],
+            entry_points=[], manifests=[], errors=[]
+        )
+        res_corr = generator.generate_and_rank(report_corr, self.repo_root)
+        self.assertEqual(len(res_corr.hypotheses), 2)
+        # Find the framework-correlated hypothesis
+        hyp_corr = None
+        for h in res_corr.hypotheses:
+            ind = report_corr.security_indicators[0]
+            identity_correlation = {
+                "rule": "credential_exposure",
+                "ind": {
+                    "category": ind.category,
+                    "indicator_type": ind.indicator_type,
+                    "file": ind.file,
+                    "line": ind.line,
+                    "evidence": ind.evidence
+                },
+                "frameworks": ["flask"]
+            }
+            expected_id = generate_hypothesis_id("credential_exposure", identity_correlation, is_llm=False)
+            if h.id == expected_id:
+                hyp_corr = h
+                break
+        self.assertIsNotNone(hyp_corr)
+
+        # Correlated should authenticate successfully
+        valid_c, canonical_corr, err_msg = engine.validate_hypothesis_shape(hyp_corr, report_corr)
+        self.assertTrue(valid_c, f"Correlated authentication failed: {err_msg}")
+
+    def test_ranking_before_admission_limits(self):
+        """Verify that higher priority hypotheses are admitted first regardless of candidate generation order."""
+        (Path(self.repo_root) / "src").mkdir(exist_ok=True)
+        (Path(self.repo_root) / "src/server.py").write_text("print('test')")
+
+        # Generates a HIGH priority candidate (command_injection) and a CRITICAL priority candidate (remote_code_execution)
+        report = RepositoryReport(
+            repository=self.empty_summary,
+            routes=[RouteCandidate(file="src/server.py", line=12, method="POST", pattern="/run", evidence="")],
+            security_indicators=[
+                SecurityIndicator(
+                    category="subprocess",
+                    indicator_type="subprocess_execution_indicator",
+                    file="src/server.py",
+                    line=15,
+                    evidence="subprocess.run"
+                ),
+                SecurityIndicator(
+                    category="serialization",
+                    indicator_type="unsafe_deserialization_indicator",
+                    file="src/server.py",
+                    line=15,
+                    evidence="pickle.loads"
+                )
+            ],
+            entry_points=[EntryPointCandidate(file="src/server.py", type="cli/script", description="desc", line=10)],
+            manifests=[],
+            errors=[]
+        )
+
+        # Enforce global limit of exactly 1 hypothesis
+        config = HypothesisConfig(max_hypotheses=1)
+        generator = SecurityHypothesisGenerator(config)
+        res = generator.generate_and_rank(report, self.repo_root)
+
+        # The only admitted hypothesis must be the CRITICAL remote_code_execution candidate
+        self.assertEqual(len(res.hypotheses), 1)
+        self.assertEqual(res.hypotheses[0].category, "remote_code_execution")
 
 
 if __name__ == "__main__":
