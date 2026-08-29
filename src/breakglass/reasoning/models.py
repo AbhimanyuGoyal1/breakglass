@@ -12,6 +12,12 @@ class EvidenceReference:
     file: str
     line: Optional[int] = None
     detail: str = ""
+    fingerprint: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.fingerprint and self.detail:
+            import hashlib
+            self.fingerprint = hashlib.sha256(self.detail.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> Dict[str, Any]:
         res = {
@@ -21,6 +27,8 @@ class EvidenceReference:
         }
         if self.line is not None:
             res["line"] = self.line
+        if self.fingerprint is not None:
+            res["fingerprint"] = self.fingerprint
         return res
 
 

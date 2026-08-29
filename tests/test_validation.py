@@ -328,15 +328,20 @@ class TestSandboxValidation(unittest.TestCase):
     # --- 6. EVIDENCE DETAILS CANONICALIZATION ---
 
     def test_evidence_detail_canonicalization(self):
-        """Verify caller-provided detail is ignored and replaced with authoritative inspection report findings."""
+        """Verify caller-provided detail with incorrect/fabricated detail/fingerprint is rejected."""
         validator = MockSandboxValidator()
         engine = ValidationEngine(validator)
 
         # Caller provides fabricated details
         ref = EvidenceReference(type="route", file="src/server.py", line=12, detail="EXECUTE DANGEROUS SHELL HERE")
         valid, auth_detail = engine._resolve_and_validate_evidence(ref, self.report)
-        self.assertTrue(valid)
-        self.assertEqual(auth_detail, "Route: POST /run")  # Replaced with authoritative description
+        self.assertFalse(valid)
+
+        # Caller provides correct details
+        ref_ok = EvidenceReference(type="route", file="src/server.py", line=12, detail="Route: POST /run")
+        valid_ok, auth_detail_ok = engine._resolve_and_validate_evidence(ref_ok, self.report)
+        self.assertTrue(valid_ok)
+        self.assertEqual(auth_detail_ok, "Route: POST /run")
 
     # --- 7. VALIDATOR RESULT INTEGRITY ---
 

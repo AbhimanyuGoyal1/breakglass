@@ -8,7 +8,7 @@ from breakglass.reasoning.models import SecurityHypothesis, EvidenceReference
 from breakglass.evidence.models import EvidenceGraph, EvidenceNode, EvidenceEdge, EvidenceGraphConfig
 from breakglass.inspection.scanner import _is_contained_in
 from breakglass.inspection.indicators import redact_secrets
-from breakglass.evidence.auth import authenticate_evidence_reference
+from breakglass.evidence.auth import authenticate_evidence_reference, _match_indicator_detail
 
 def generate_finding_id(kind: str, file: str, line: Optional[int], extra: str) -> str:
     """Generates a stable finding ID for provenance mapping in the graph."""
@@ -16,6 +16,14 @@ def generate_finding_id(kind: str, file: str, line: Optional[int], extra: str) -
     canonical = f"{kind}:{norm_file}:{line}:{extra}"
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return f"FIND-{kind.upper().replace('_', '-')}-{digest[:16]}"
+
+def _safe_utf8_truncate(s: str, max_bytes: int) -> str:
+    """Genuinely byte-safe UTF-8 truncation discarding incomplete trailing code units."""
+    encoded = s.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return s
+    truncated_bytes = encoded[:max_bytes]
+    return truncated_bytes.decode("utf-8", errors="ignore")
 
 
 class EvidenceGraphBuilder:
@@ -34,8 +42,8 @@ class EvidenceGraphBuilder:
         graph = EvidenceGraph(self.config)
         graph.metadata["repository_root"] = repo_root.replace("\\", "/")
 
-        # Map to find node ID from (type, file, line)
-        finding_to_evid_id: Dict[Tuple[str, str, Optional[int]], str] = {}
+        # Map to find node ID from unique finding ID
+        finding_to_evid_id: Dict[str, str] = {}
 
         # 1. Process Security Indicators
         for ind in getattr(report, "security_indicators", []) or []:
@@ -55,13 +63,12 @@ class EvidenceGraphBuilder:
                 ind_type = getattr(ind, "indicator_type", "")
                 raw_ev = getattr(ind, "evidence", "") or ""
                 
-                # Redact secrets and enforce limits
+                # Redact secrets and enforce limits via byte-safe UTF-8 truncation
                 snippet = redact_secrets(raw_ev)
-                if len(snippet.encode("utf-8")) > self.config.max_evidence_snippet_bytes:
-                    snippet = snippet[:self.config.max_evidence_snippet_bytes]
+                snippet = _safe_utf8_truncate(snippet, self.config.max_evidence_snippet_bytes)
 
                 confidence = getattr(ind, "confidence", None)
-                if confidence is None or not isinstance(confidence, (int, float)):
+                if confidence is None or not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
                     confidence = 0.8
 
                 node = EvidenceNode(
@@ -77,10 +84,12 @@ class EvidenceGraphBuilder:
                     }
                 )
                 evid_id = graph.add_node(node)
-                finding_to_evid_id[("security_indicator", ind_file.replace("\\", "/"), node.line)] = evid_id
+                
+                # Use unique finding ID (Finding 3)
+                find_id = generate_finding_id("indicator", ind_file, node.line, snippet)
+                finding_to_evid_id[find_id] = evid_id
 
                 # Create finding to evidence edge
-                find_id = generate_finding_id("indicator", ind_file, node.line, category)
                 graph.add_edge(EvidenceEdge(
                     source_id=find_id,
                     target_id=evid_id,
@@ -109,11 +118,10 @@ class EvidenceGraphBuilder:
                 raw_ev = getattr(r, "evidence", "") or ""
 
                 snippet = redact_secrets(raw_ev)
-                if len(snippet.encode("utf-8")) > self.config.max_evidence_snippet_bytes:
-                    snippet = snippet[:self.config.max_evidence_snippet_bytes]
+                snippet = _safe_utf8_truncate(snippet, self.config.max_evidence_snippet_bytes)
 
                 confidence = getattr(r, "confidence", None)
-                if confidence is None or not isinstance(confidence, (int, float)):
+                if confidence is None or not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
                     confidence = 0.85
 
                 node = EvidenceNode(
@@ -129,9 +137,10 @@ class EvidenceGraphBuilder:
                     }
                 )
                 evid_id = graph.add_node(node)
-                finding_to_evid_id[("route", r_file.replace("\\", "/"), node.line)] = evid_id
 
                 find_id = generate_finding_id("route", r_file, node.line, f"{method} {pattern}")
+                finding_to_evid_id[find_id] = evid_id
+
                 graph.add_edge(EvidenceEdge(
                     source_id=find_id,
                     target_id=evid_id,
@@ -158,11 +167,10 @@ class EvidenceGraphBuilder:
                 desc = getattr(ep, "description", "") or ""
 
                 snippet = redact_secrets(desc)
-                if len(snippet.encode("utf-8")) > self.config.max_evidence_snippet_bytes:
-                    snippet = snippet[:self.config.max_evidence_snippet_bytes]
+                snippet = _safe_utf8_truncate(snippet, self.config.max_evidence_snippet_bytes)
 
                 confidence = getattr(ep, "confidence", None)
-                if confidence is None or not isinstance(confidence, (int, float)):
+                if confidence is None or not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
                     confidence = 0.8
 
                 node = EvidenceNode(
@@ -177,9 +185,10 @@ class EvidenceGraphBuilder:
                     }
                 )
                 evid_id = graph.add_node(node)
-                finding_to_evid_id[("entry_point", ep_file.replace("\\", "/"), node.line)] = evid_id
 
                 find_id = generate_finding_id("entry_point", ep_file, node.line, ep_type)
+                finding_to_evid_id[find_id] = evid_id
+
                 graph.add_edge(EvidenceEdge(
                     source_id=find_id,
                     target_id=evid_id,
@@ -189,7 +198,7 @@ class EvidenceGraphBuilder:
             except Exception:
                 continue
 
-        # 4. Connect Evidence to Hypotheses
+        # 4. Connect Evidence to Hypotheses (enforcing strict authentication)
         for hyp in hypotheses:
             if hyp is None:
                 continue
@@ -208,36 +217,84 @@ class EvidenceGraphBuilder:
                     if ref is None:
                         continue
                     
+                    # Finding 8: Validate the supplied reference through the canonical boundary first
+                    valid, auth_detail = authenticate_evidence_reference(ref, report, repo_root, self.config)
+                    if not valid:
+                        continue
+                    
                     ref_file = getattr(ref, "file", None)
                     ref_type = getattr(ref, "type", None)
                     ref_line = getattr(ref, "line", None)
                     if not ref_file or not ref_type:
                         continue
 
+                    node_id = None
                     ref_file_norm = ref_file.replace("\\", "/")
-                    node_id = finding_to_evid_id.get((ref_type, ref_file_norm, ref_line))
 
-                    # If node does not exist (e.g., file reference or unmapped), create it dynamically
+                    # Map authenticated reference to its unique finding ID node
+                    if ref_type == "security_indicator":
+                        for ind in getattr(report, "security_indicators", []) or []:
+                            if ind is None:
+                                continue
+                            ind_file = getattr(ind, "file", None)
+                            ind_line = getattr(ind, "line", None)
+                            if ind_file and ind_file.replace("\\", "/") == ref_file_norm:
+                                if ind_line == ref_line or (ind_line is None and ref_line is None):
+                                    if _match_indicator_detail(ind, auth_detail):
+                                        snippet = redact_secrets(getattr(ind, "evidence", "") or "")
+                                        snippet = _safe_utf8_truncate(snippet, self.config.max_evidence_snippet_bytes)
+                                        find_id = generate_finding_id("indicator", ind_file, ind_line, snippet)
+                                        node_id = finding_to_evid_id.get(find_id)
+                                        break
+
+                    elif ref_type == "route":
+                        for r in getattr(report, "routes", []) or []:
+                            if r is None:
+                                continue
+                            r_file = getattr(r, "file", None)
+                            r_line = getattr(r, "line", None)
+                            if r_file and r_file.replace("\\", "/") == ref_file_norm and r_line == ref_line:
+                                method = getattr(r, "method", "")
+                                pattern = getattr(r, "pattern", "")
+                                if auth_detail == f"Route: {method} {pattern}":
+                                    find_id = generate_finding_id("route", r_file, r_line, f"{method} {pattern}")
+                                    node_id = finding_to_evid_id.get(find_id)
+                                    break
+
+                    elif ref_type == "entry_point":
+                        for ep in getattr(report, "entry_points", []) or []:
+                            if ep is None:
+                                continue
+                            ep_file = getattr(ep, "file", None)
+                            ep_line = getattr(ep, "line", None)
+                            if ep_file and ep_file.replace("\\", "/") == ref_file_norm and ep_line == ref_line:
+                                ep_type = getattr(ep, "type", "")
+                                desc = getattr(ep, "description", "")
+                                if auth_detail == f"Entry point: {ep_type} ({desc})":
+                                    find_id = generate_finding_id("entry_point", ep_file, ep_line, ep_type)
+                                    node_id = finding_to_evid_id.get(find_id)
+                                    break
+
+                    elif ref_type == "file":
+                        # Determine if we already created a node for this file
+                        find_id = generate_finding_id("file", ref_file, None, "")
+                        node_id = finding_to_evid_id.get(find_id)
+                        if not node_id:
+                            # Verify if it was authenticated as a valid file
+                            if auth_detail == f"File: {ref_file_norm}":
+                                node = EvidenceNode(
+                                    kind="file",
+                                    path=ref_file,
+                                    content="",
+                                    source="repository_inspection",
+                                    confidence=1.0,
+                                    provenance_metadata={}
+                                )
+                                node_id = graph.add_node(node)
+                                finding_to_evid_id[find_id] = node_id
+
                     if not node_id:
-                        # Validate path containment
-                        abs_path = Path(repo_root) / ref_file
-                        if not _is_contained_in(Path(repo_root), abs_path):
-                            continue
-
-                        if ref_type == "file" and ref_line is None:
-                            node = EvidenceNode(
-                                kind="file",
-                                path=ref_file,
-                                content="",
-                                source="repository_inspection",
-                                confidence=1.0,
-                                provenance_metadata={}
-                            )
-                            node_id = graph.add_node(node)
-                            finding_to_evid_id[("file", ref_file_norm, None)] = node_id
-                        else:
-                            # Skip untrusted or unauthenticated references
-                            continue
+                        continue
 
                     evid_nodes_for_hyp.append(node_id)
 

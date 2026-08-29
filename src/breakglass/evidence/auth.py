@@ -1,5 +1,6 @@
 import os
 import math
+import hashlib
 from pathlib import Path
 from typing import Tuple, Optional, Any
 from breakglass.reasoning.models import EvidenceReference
@@ -57,6 +58,7 @@ def authenticate_evidence_reference(
     2. Path normalization and component-aware containment.
     3. Authenticity against RepositoryReport findings.
     4. Bounded detail length limits.
+    5. Fingerprint verification of details.
     """
     cfg = config or EvidenceGraphConfig()
     
@@ -86,6 +88,8 @@ def authenticate_evidence_reference(
         return False, ""
 
     # 4. Provenance and Authenticity matching against report findings
+    canonical_detail = None
+
     if ref.type == "security_indicator":
         for ind in getattr(report, "security_indicators", []) or []:
             if ind is None:
@@ -96,8 +100,8 @@ def authenticate_evidence_reference(
             if ind_file and ind_file.replace("\\", "/") == file_norm:
                 if ind_line == ref.line or (ind_line is None and ref.line is None):
                     if _match_indicator_detail(ind, ref.detail):
-                        return True, ref.detail
-        return False, ""
+                        canonical_detail = ref.detail
+                        break
 
     elif ref.type == "route":
         # 1st Pass: attempt precise match on method/pattern if detail matches
@@ -112,20 +116,22 @@ def authenticate_evidence_reference(
                 pattern = getattr(r, "pattern", "")
                 expected_detail = f"Route: {method} {pattern}"
                 if ref.detail == expected_detail:
-                    return True, expected_detail
+                    canonical_detail = expected_detail
+                    break
         
         # 2nd Pass: Fallback for coordinate matching
-        for r in getattr(report, "routes", []) or []:
-            if r is None:
-                continue
-            r_file = getattr(r, "file", None)
-            r_line = getattr(r, "line", None)
-            
-            if r_file and r_file.replace("\\", "/") == file_norm and r_line == ref.line:
-                method = getattr(r, "method", "")
-                pattern = getattr(r, "pattern", "")
-                return True, f"Route: {method} {pattern}"
-        return False, ""
+        if not canonical_detail:
+            for r in getattr(report, "routes", []) or []:
+                if r is None:
+                    continue
+                r_file = getattr(r, "file", None)
+                r_line = getattr(r, "line", None)
+                
+                if r_file and r_file.replace("\\", "/") == file_norm and r_line == ref.line:
+                    method = getattr(r, "method", "")
+                    pattern = getattr(r, "pattern", "")
+                    canonical_detail = f"Route: {method} {pattern}"
+                    break
 
     elif ref.type == "entry_point":
         # 1st Pass: precise match
@@ -140,20 +146,22 @@ def authenticate_evidence_reference(
                 desc = getattr(ep, "description", "")
                 expected_detail = f"Entry point: {ep_type} ({desc})"
                 if ref.detail == expected_detail:
-                    return True, expected_detail
+                    canonical_detail = expected_detail
+                    break
 
         # 2nd Pass: coordinate fallback
-        for ep in getattr(report, "entry_points", []) or []:
-            if ep is None:
-                continue
-            ep_file = getattr(ep, "file", None)
-            ep_line = getattr(ep, "line", None)
-            
-            if ep_file and ep_file.replace("\\", "/") == file_norm and ep_line == ref.line:
-                ep_type = getattr(ep, "type", "")
-                desc = getattr(ep, "description", "")
-                return True, f"Entry point: {ep_type} ({desc})"
-        return False, ""
+        if not canonical_detail:
+            for ep in getattr(report, "entry_points", []) or []:
+                if ep is None:
+                    continue
+                ep_file = getattr(ep, "file", None)
+                ep_line = getattr(ep, "line", None)
+                
+                if ep_file and ep_file.replace("\\", "/") == file_norm and ep_line == ref.line:
+                    ep_type = getattr(ep, "type", "")
+                    desc = getattr(ep, "description", "")
+                    canonical_detail = f"Entry point: {ep_type} ({desc})"
+                    break
 
     elif ref.type == "file":
         if ref.line is not None:
@@ -168,6 +176,11 @@ def authenticate_evidence_reference(
                     if f:
                         valid_files.add(f.replace("\\", "/"))
 
+        # Add manifest files to valid_files set
+        for m in getattr(report, "manifests", []) or []:
+            if m and getattr(m, "file", None):
+                valid_files.add(m.file.replace("\\", "/"))
+
         for r in getattr(report, "routes", []) or []:
             if r and getattr(r, "file", None):
                 valid_files.add(r.file.replace("\\", "/"))
@@ -179,7 +192,15 @@ def authenticate_evidence_reference(
                 valid_files.add(ind.file.replace("\\", "/"))
 
         if file_norm in valid_files:
-            return True, f"File: {file_norm}"
+            canonical_detail = f"File: {file_norm}"
+
+    if not canonical_detail:
         return False, ""
 
-    return False, ""
+    # 5. Fingerprint verification
+    expected_fp = hashlib.sha256(canonical_detail.encode("utf-8")).hexdigest()
+    if ref.fingerprint:
+        if ref.fingerprint != expected_fp:
+            return False, ""
+
+    return True, canonical_detail
