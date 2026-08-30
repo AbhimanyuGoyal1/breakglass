@@ -147,12 +147,40 @@ def analyze_file_for_attack_chains(
                     "func_name": "<global>"
                 }
                 self.has_session_reference = False
+                self.xml_imports = {"ET", "etree", "ElementTree", "lxml", "xml"}
+                self.safe_parsers = set()
 
             @property
             def current_scope(self):
                 if self.func_stack:
                     return self.func_scopes[self.func_stack[-1]]
                 return self.global_scope
+
+            def visit_Import(self, node):
+                try:
+                    for name in node.names:
+                        if any(x in name.name for x in ("xml.etree", "lxml", "defusedxml")):
+                            alias = name.asname or name.name.split(".")[-1]
+                            self.xml_imports.add(alias)
+                except Exception:
+                    pass
+                try:
+                    self.generic_visit(node)
+                except Exception:
+                    pass
+
+            def visit_ImportFrom(self, node):
+                try:
+                    if node.module and any(x in node.module for x in ("xml.etree", "lxml", "defusedxml")):
+                        for name in node.names:
+                            alias = name.asname or name.name
+                            self.xml_imports.add(alias)
+                except Exception:
+                    pass
+                try:
+                    self.generic_visit(node)
+                except Exception:
+                    pass
 
             def visit_Name(self, node):
                 try:
@@ -247,6 +275,23 @@ def analyze_file_for_attack_chains(
             def visit_Assign(self, node):
                 try:
                     scope = self.current_scope
+                    
+                    # Track resolver configurations to identify resolve_entities=False as safe
+                    if isinstance(node.value, ast.Call):
+                        rec, meth = get_receiver_and_method(node.value.func)
+                        if meth == "XMLParser":
+                            resolve_entities_val = True
+                            for kw in node.value.keywords:
+                                if kw.arg == "resolve_entities":
+                                    if isinstance(kw.value, ast.Constant) and kw.value.value is False:
+                                        resolve_entities_val = False
+                                    elif isinstance(kw.value, ast.Name) and kw.value.id in ("False", "None"):
+                                        resolve_entities_val = False
+                            if not resolve_entities_val:
+                                for target in node.targets:
+                                    if isinstance(target, ast.Name):
+                                        self.safe_parsers.add(target.id)
+
                     targets = []
                     for t in node.targets:
                         if isinstance(t, ast.Name):
@@ -373,10 +418,22 @@ def analyze_file_for_attack_chains(
                             # 7. XXE
                             elif method_name in ("parse", "fromstring", "XMLParser", "parseXML"):
                                 is_xml = False
-                                if receiver and any((x in receiver.lower() or receiver.lower() in x) for x in ("et", "etree", "elementtree", "xml", "lxml")):
+                                if receiver and (receiver in self.xml_imports or any((x in receiver.lower() or receiver.lower() in x) for x in ("et", "etree", "elementtree", "xml", "lxml"))):
                                     is_xml = True
-                                elif not receiver:
-                                    is_xml = any(x in content for x in ("xml", "etree", "ElementTree", "lxml"))
+                                elif not receiver and method_name in self.xml_imports:
+                                    is_xml = True
+                                
+                                if is_xml:
+                                    parser_arg = None
+                                    if len(node.args) >= 2:
+                                        parser_arg = node.args[1]
+                                    for kw in node.keywords:
+                                        if kw.arg == "parser":
+                                            parser_arg = kw.value
+                                            break
+                                    if isinstance(parser_arg, ast.Name) and parser_arg.id in self.safe_parsers:
+                                        is_xml = False
+
                                 if is_xml:
                                     cat = "xxe"
                                 

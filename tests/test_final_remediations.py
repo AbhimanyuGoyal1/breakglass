@@ -764,3 +764,131 @@ class TestPR13Remediations(unittest.TestCase):
         self.assertEqual(res.status, ValidationStatus.NOT_CONFIRMED)
         self.assertFalse(res.confirmed)
 
+
+class TestXXEDetectionRemediation(unittest.TestCase):
+    """Regression tests verifying remediations for Qodo Finding #6 XXE detection false positives."""
+
+    def test_import_only_no_xxe(self):
+        """Verify file containing only import xml.etree.ElementTree has no XXE findings."""
+        code = "import xml.etree.ElementTree as ET\n"
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                xxe_chains = [h for h in res if h.category == "xxe"]
+                self.assertEqual(len(xxe_chains), 0)
+
+    def test_xml_strings_no_xxe(self):
+        """Verify file containing XML-related strings/comments/configuration has no XXE findings."""
+        code = (
+            "# This is xml processing module\n"
+            "# etree / ElementTree config\n"
+            "xml_config = '<xml>test</xml>'\n"
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                xxe_chains = [h for h in res if h.category == "xxe"]
+                self.assertEqual(len(xxe_chains), 0)
+
+    def test_xml_parser_constant_input_no_xxe(self):
+        """Verify XML parser invocation with a constant/safe input has no XXE findings."""
+        code = (
+            "import lxml.etree as ET\n"
+            "parser = ET.XMLParser(resolve_entities=True)\n"
+            "root = ET.fromstring('<xml>constant</xml>', parser)\n"
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[
+                SecurityIndicator("xml", "xml", "app.py", 3, "ET.fromstring")
+            ]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                xxe_chains = [h for h in res if h.category == "xxe"]
+                self.assertEqual(len(xxe_chains), 0)
+
+    def test_xml_parser_untainted_local_value_no_xxe(self):
+        """Verify parser invocation receiving an untainted local value has no XXE findings."""
+        code = (
+            "import lxml.etree as ET\n"
+            "local_val = '<xml>safe</xml>'\n"
+            "parser = ET.XMLParser(resolve_entities=True)\n"
+            "root = ET.fromstring(local_val, parser)\n"
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[
+                SecurityIndicator("xml", "xml", "app.py", 4, "ET.fromstring")
+            ]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                xxe_chains = [h for h in res if h.category == "xxe"]
+                self.assertEqual(len(xxe_chains), 0)
+
+    def test_xml_parser_safe_resolve_entities_false_no_xxe(self):
+        """Verify parser configured with resolve_entities=False has no XXE findings even if input is tainted."""
+        code = (
+            "import lxml.etree as ET\n"
+            "body = request.get_data()\n"
+            "parser = ET.XMLParser(resolve_entities=False)\n"
+            "root = ET.fromstring(body, parser)\n"
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[
+                SecurityIndicator("xml", "xml", "app.py", 4, "ET.fromstring")
+            ]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                xxe_chains = [h for h in res if h.category == "xxe"]
+                self.assertEqual(len(xxe_chains), 0)
+
+    def test_xml_parser_vulnerable_positive_case(self):
+        """Verify minimal vulnerable example correctly flags XXE on the exact parser call line."""
+        code = (
+            "import lxml.etree as ET\n"
+            "from flask import request\n"
+            "body = request.get_data()\n"
+            "parser = ET.XMLParser(resolve_entities=True)\n"
+            "root = ET.fromstring(body, parser)\n"  # vulnerable call on line 5
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[
+                SecurityIndicator("xml", "xml", "app.py", 5, "ET.fromstring")
+            ]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                xxe_chains = [h for h in res if h.category == "xxe"]
+                self.assertEqual(len(xxe_chains), 1)
+                self.assertEqual(xxe_chains[0].evidence_references[-1].line, 5)
+
+
