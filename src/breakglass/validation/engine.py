@@ -251,123 +251,270 @@ class ValidationEngine:
                     return False
 
             if hypothesis.category == "command_injection":
+                lines = sorted(list({r.line for r in canonical_references if r.line is not None}))
+                file_val = canonical_references[0].file if canonical_references else ""
+                has_auth = any("access control" in getattr(r, "detail", "").lower() or "session" in getattr(r, "detail", "").lower() or "authentication" in getattr(r, "detail", "").lower() for r in canonical_references)
+                
+                identity_chain = {
+                    "rule": "attack_chain",
+                    "file": file_val,
+                    "category": hypothesis.category,
+                    "lines": lines,
+                    "has_auth": has_auth
+                }
+                id_chain = generate_hypothesis_id(hypothesis.category, identity_chain, is_llm=False)
+                
                 route_ref = next((r for r in canonical_references if r.type == "route"), None)
                 route = None
                 if route_ref:
                     route = next((r for r in report.routes if r.file == route_ref.file and r.line == route_ref.line), None)
-                if not ind or not route:
-                    return False
-                identity = {
-                    "rule": "command_injection",
-                    "ind": {
-                        "category": ind.category,
-                        "indicator_type": ind.indicator_type,
-                        "file": ind.file,
-                        "line": ind.line,
-                        "evidence": redact_secrets(ind.evidence)
-                    },
-                    "route": {
-                        "file": route.file,
-                        "line": route.line,
-                        "method": route.method,
-                        "pattern": route.pattern,
-                        "evidence": route.evidence
+                    
+                if ind and route:
+                    identity_std = {
+                        "rule": "command_injection",
+                        "ind": {
+                            "category": ind.category,
+                            "indicator_type": ind.indicator_type,
+                            "file": ind.file,
+                            "line": ind.line,
+                            "evidence": redact_secrets(ind.evidence)
+                        },
+                        "route": {
+                            "file": route.file,
+                            "line": route.line,
+                            "method": route.method,
+                            "pattern": route.pattern,
+                            "evidence": route.evidence
+                        }
                     }
-                }
+                    id_std = generate_hypothesis_id(hypothesis.category, identity_std, is_llm=False)
+                    if hypothesis.id == id_std:
+                        identity = identity_std
+                    elif hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
+                else:
+                    if hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
             elif hypothesis.category == "sql_injection":
+                lines = sorted(list({r.line for r in canonical_references if r.line is not None}))
+                file_val = canonical_references[0].file if canonical_references else ""
+                has_auth = any("access control" in getattr(r, "detail", "").lower() or "session" in getattr(r, "detail", "").lower() or "authentication" in getattr(r, "detail", "").lower() for r in canonical_references)
+                
+                identity_chain = {
+                    "rule": "attack_chain",
+                    "file": file_val,
+                    "category": hypothesis.category,
+                    "lines": lines,
+                    "has_auth": has_auth
+                }
+                id_chain = generate_hypothesis_id(hypothesis.category, identity_chain, is_llm=False)
+                
                 route_ref = next((r for r in canonical_references if r.type == "route"), None)
                 route = None
                 if route_ref:
                     route = next((r for r in report.routes if r.file == route_ref.file and r.line == route_ref.line), None)
-                if not ind or not route:
-                    return False
-                identity = {
-                    "rule": "sql_injection",
-                    "ind": {
-                        "category": ind.category,
-                        "indicator_type": ind.indicator_type,
-                        "file": ind.file,
-                        "line": ind.line,
-                        "evidence": redact_secrets(ind.evidence)
-                    },
-                    "route": {
-                        "file": route.file,
-                        "line": route.line,
-                        "method": route.method,
-                        "pattern": route.pattern,
-                        "evidence": route.evidence
+                    
+                if ind and route:
+                    identity_std = {
+                        "rule": "sql_injection",
+                        "ind": {
+                            "category": ind.category,
+                            "indicator_type": ind.indicator_type,
+                            "file": ind.file,
+                            "line": ind.line,
+                            "evidence": redact_secrets(ind.evidence)
+                        },
+                        "route": {
+                            "file": route.file,
+                            "line": route.line,
+                            "method": route.method,
+                            "pattern": route.pattern,
+                            "evidence": route.evidence
+                        }
                     }
-                }
+                    id_std = generate_hypothesis_id(hypothesis.category, identity_std, is_llm=False)
+                    if hypothesis.id == id_std:
+                        identity = identity_std
+                    elif hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
+                else:
+                    if hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
             elif hypothesis.category == "remote_code_execution":
+                lines = sorted(list({r.line for r in canonical_references if r.line is not None}))
+                file_val = canonical_references[0].file if canonical_references else ""
+                has_auth = any("access control" in getattr(r, "detail", "").lower() or "session" in getattr(r, "detail", "").lower() or "authentication" in getattr(r, "detail", "").lower() for r in canonical_references)
+                
+                identity_chain = {
+                    "rule": "attack_chain",
+                    "file": file_val,
+                    "category": hypothesis.category,
+                    "lines": lines,
+                    "has_auth": has_auth
+                }
+                id_chain = generate_hypothesis_id(hypothesis.category, identity_chain, is_llm=False)
+                
                 ep_ref = next((r for r in canonical_references if r.type == "entry_point"), None)
                 ep = None
                 if ep_ref:
                     ep = next((e for e in report.entry_points if e.file == ep_ref.file and e.line == ep_ref.line), None)
-                if not ind or not ep:
-                    return False
-                identity = {
-                    "rule": "remote_code_execution",
-                    "ind": {
-                        "category": ind.category,
-                        "indicator_type": ind.indicator_type,
-                        "file": ind.file,
-                        "line": ind.line,
-                        "evidence": redact_secrets(ind.evidence)
-                    },
-                    "entry_point": {
-                        "file": ep.file,
-                        "type": ep.type,
-                        "description": ep.description,
-                        "line": ep.line
+                    
+                if ind and ep:
+                    identity_std = {
+                        "rule": "remote_code_execution",
+                        "ind": {
+                            "category": ind.category,
+                            "indicator_type": ind.indicator_type,
+                            "file": ind.file,
+                            "line": ind.line,
+                            "evidence": redact_secrets(ind.evidence)
+                        },
+                        "entry_point": {
+                            "file": ep.file,
+                            "type": ep.type,
+                            "description": ep.description,
+                            "line": ep.line
+                        }
                     }
-                }
+                    id_std = generate_hypothesis_id(hypothesis.category, identity_std, is_llm=False)
+                    if hypothesis.id == id_std:
+                        identity = identity_std
+                    elif hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
+                else:
+                    if hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
             elif hypothesis.category == "credential_exposure":
-                if not ind:
-                    return False
-                sorted_frameworks = sorted(list(set(report.repository.frameworks)))
-                identity_correlation = {
-                    "rule": "credential_exposure",
-                    "ind": {
-                        "category": ind.category,
-                        "indicator_type": ind.indicator_type,
+                lines = sorted(list({r.line for r in canonical_references if r.line is not None}))
+                file_val = canonical_references[0].file if canonical_references else ""
+                
+                identity_consolidated = {
+                    "rule": "consolidated_secret",
+                    "file": file_val,
+                    "lines": lines
+                }
+                id_cons = generate_hypothesis_id(hypothesis.category, identity_consolidated, is_llm=False)
+                
+                if ind:
+                    sorted_frameworks = sorted(list(set(report.repository.frameworks)))
+                    identity_correlation = {
+                        "rule": "credential_exposure",
+                        "ind": {
+                            "category": ind.category,
+                            "indicator_type": ind.indicator_type,
+                            "file": ind.file,
+                            "line": ind.line,
+                            "evidence": redact_secrets(ind.evidence)
+                        },
+                        "frameworks": sorted_frameworks
+                    }
+                    identity_standalone = {
+                        "rule": "ind_secret",
                         "file": ind.file,
                         "line": ind.line,
                         "evidence": redact_secrets(ind.evidence)
-                    },
-                    "frameworks": sorted_frameworks
-                }
-                identity_standalone = {
-                    "rule": "ind_secret",
-                    "file": ind.file,
-                    "line": ind.line,
-                    "evidence": redact_secrets(ind.evidence)
-                }
-                id_corr = generate_hypothesis_id(hypothesis.category, identity_correlation, is_llm=False)
-                id_stan = generate_hypothesis_id(hypothesis.category, identity_standalone, is_llm=False)
-                if hypothesis.id == id_corr:
-                    identity = identity_correlation
-                elif hypothesis.id == id_stan:
-                    identity = identity_standalone
+                    }
+                    id_corr = generate_hypothesis_id(hypothesis.category, identity_correlation, is_llm=False)
+                    id_stan = generate_hypothesis_id(hypothesis.category, identity_standalone, is_llm=False)
+                    if hypothesis.id == id_corr:
+                        identity = identity_correlation
+                    elif hypothesis.id == id_stan:
+                        identity = identity_standalone
+                    elif hypothesis.id == id_cons:
+                        identity = identity_consolidated
+                    else:
+                        return False
                 else:
-                    return False
+                    if hypothesis.id == id_cons:
+                        identity = identity_consolidated
+                    else:
+                        return False
             elif hypothesis.category == "insecure_auth":
-                if not ind:
-                    return False
-                identity = {
-                    "rule": "ind_auth",
-                    "file": ind.file,
-                    "line": ind.line,
-                    "evidence": redact_secrets(ind.evidence)
+                lines = sorted(list({r.line for r in canonical_references if r.line is not None}))
+                file_val = canonical_references[0].file if canonical_references else ""
+                
+                identity_consolidated = {
+                    "rule": "consolidated_auth",
+                    "file": file_val,
+                    "lines": lines
                 }
+                id_cons = generate_hypothesis_id(hypothesis.category, identity_consolidated, is_llm=False)
+                
+                if ind:
+                    identity_standalone = {
+                        "rule": "ind_auth",
+                        "file": ind.file,
+                        "line": ind.line,
+                        "evidence": redact_secrets(ind.evidence)
+                    }
+                    id_stan = generate_hypothesis_id(hypothesis.category, identity_standalone, is_llm=False)
+                    if hypothesis.id == id_stan:
+                        identity = identity_standalone
+                    elif hypothesis.id == id_cons:
+                        identity = identity_consolidated
+                    else:
+                        return False
+                else:
+                    if hypothesis.id == id_cons:
+                        identity = identity_consolidated
+                    else:
+                        return False
             elif hypothesis.category == "path_traversal":
-                if not ind:
-                    return False
-                identity = {
-                    "rule": "ind_file",
-                    "file": ind.file,
-                    "line": ind.line,
-                    "evidence": redact_secrets(ind.evidence)
+                lines = sorted(list({r.line for r in canonical_references if r.line is not None}))
+                file_val = canonical_references[0].file if canonical_references else ""
+                has_auth = any("access control" in getattr(r, "detail", "").lower() or "session" in getattr(r, "detail", "").lower() or "authentication" in getattr(r, "detail", "").lower() for r in canonical_references)
+                
+                identity_chain = {
+                    "rule": "attack_chain",
+                    "file": file_val,
+                    "category": hypothesis.category,
+                    "lines": lines,
+                    "has_auth": has_auth
                 }
+                id_chain = generate_hypothesis_id(hypothesis.category, identity_chain, is_llm=False)
+                
+                identity_consolidated = {
+                    "rule": "consolidated_file",
+                    "file": file_val,
+                    "lines": lines
+                }
+                id_cons = generate_hypothesis_id(hypothesis.category, identity_consolidated, is_llm=False)
+                
+                if ind:
+                    identity_standalone = {
+                        "rule": "ind_file",
+                        "file": ind.file,
+                        "line": ind.line,
+                        "evidence": redact_secrets(ind.evidence)
+                    }
+                    id_stan = generate_hypothesis_id(hypothesis.category, identity_standalone, is_llm=False)
+                    if hypothesis.id == id_stan:
+                        identity = identity_standalone
+                    elif hypothesis.id == id_cons:
+                        identity = identity_consolidated
+                    elif hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
+                else:
+                    if hypothesis.id == id_cons:
+                        identity = identity_consolidated
+                    elif hypothesis.id == id_chain:
+                        identity = identity_chain
+                    else:
+                        return False
             elif hypothesis.category == "insecure_dependency":
                 file_ref = next((r for r in canonical_references if r.type == "file"), None)
                 if not file_ref:

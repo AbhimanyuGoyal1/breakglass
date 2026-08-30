@@ -56,6 +56,26 @@ class MockSandboxValidator(SandboxValidator):
         self.last_validated.append((hypothesis, repository_context))
         if hypothesis.id in self.predefined_results:
             return self.predefined_results[hypothesis.id]
+        
+        if hypothesis.category == "sql_injection":
+            is_bypass = "authentication bypass" in hypothesis.title.lower() or "authentication bypass" in hypothesis.description.lower()
+            metadata = {}
+            if is_bypass:
+                metadata = {
+                    "dast_verdict": "confirmed",
+                    "response_code": 302,
+                    "redirect_location": "/"
+                }
+            return ValidationResult(
+                hypothesis_id=hypothesis.id,
+                status=ValidationStatus.VALIDATED,
+                attempted=True,
+                confirmed=True,
+                evidence="SQLi verification confirmed: DAST bypass check returned 302 redirecting to /",
+                confidence_delta=0.15,
+                metadata=metadata
+            )
+
         # Default fallback
         return ValidationResult(
             hypothesis_id=hypothesis.id,
