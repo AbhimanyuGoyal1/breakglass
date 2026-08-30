@@ -40,7 +40,7 @@ class TestCommandLineInterface(unittest.TestCase):
         self.assertIn("REPOSITORY INGESTION & INSPECTION SUMMARY", stdout)
         self.assertIn("Files: 8 | Directories: 4", stdout)
         self.assertIn("SECURITY HYPOTHESES GENERATED", stdout)
-        self.assertIn("Total Hypotheses: 8", stdout)
+        self.assertIn("Total Hypotheses: 10", stdout)
         self.assertIn("[HYP-COMMAND-INJECTION", stdout)
 
     def test_cli_validation_enabled(self):
@@ -71,9 +71,9 @@ class TestCommandLineInterface(unittest.TestCase):
             self.assertIn("inspection_summary", data)
             self.assertEqual(data["inspection_summary"]["security_indicators"], 6)
             self.assertIn("hypotheses", data)
-            self.assertEqual(len(data["hypotheses"]), 8)
+            self.assertEqual(len(data["hypotheses"]), 10)
             self.assertIn("validation_results", data)
-            self.assertEqual(len(data["validation_results"]), 8)
+            self.assertEqual(len(data["validation_results"]), 10)
 
     def test_cli_invalid_path_fails(self):
         """Verify providing a non-existent path results in failure exit code and error message."""

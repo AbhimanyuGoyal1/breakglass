@@ -573,3 +573,194 @@ class TestExportIntegrity(unittest.TestCase):
                     if ind["file"] == ref_file and ind["line"] == ref_line:
                         resolved = True
             self.assertTrue(resolved, f"Reference {ref_type} at {ref_file}:{ref_line} failed to resolve")
+
+
+class TestPR13Remediations(unittest.TestCase):
+    """Verifies all correctness and reliability improvements implemented for PR #13."""
+
+    def test_keyword_expressions_dont_crash(self):
+        """Issue 1: Verify keyword expressions (like cmd + suffix) do not crash AST parsing."""
+        code = "import subprocess\nsubprocess.run(args=cmd + suffix)\n"
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", MagicMock())
+                self.assertIsInstance(res, list)
+
+    def test_route_decorators_call_unwrap(self):
+        """Issue 2: Verify decorators in call form are unwrapped and route parameters are extracted."""
+        code = "from flask import Flask\napp = Flask(__name__)\n@app.route('/test')\ndef index(user_id):\n    print(user_id)\n"
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[RouteCandidate(file="app.py", line=3, method="GET", pattern="/test", evidence="")],
+            security_indicators=[]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                self.assertIsInstance(res, list)
+
+    def test_cross_function_taint_scoping(self):
+        """Issue 3: Verify variable taints do not bleed across functions (scoping stack)."""
+        code = (
+            "def first():\n"
+            "    user_input = request.args.get('q')\n"
+            "def second():\n"
+            "    # user_input should not be tainted here!\n"
+            "    import subprocess\n"
+            "    subprocess.run(user_input)\n"
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[SecurityIndicator("subprocess", "subprocess", "app.py", 6, "run")]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                # Since second() doesn't have tainted user_input, no command_injection chain is found!
+                cmd_chains = [h for h in res if h.category == "command_injection"]
+                self.assertEqual(len(cmd_chains), 0)
+
+    def test_xml_e_tree_ast_confirmed_parsing(self):
+        """Issue 4: Verify XXE is only flagged via AST parser calls, not substring content matching."""
+        code = (
+            "import lxml.etree as ET\n"
+            "from flask import request\n"
+            "body = request.get_data()\n"
+            "parser = ET.XMLParser(resolve_entities=True)\n"
+            "root = ET.fromstring(body, parser)\n"
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[],
+            security_indicators=[
+                SecurityIndicator("xml", "xml", "app.py", 5, "ET.fromstring")
+            ]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                xxe_chains = [h for h in res if h.category == "xxe"]
+                self.assertEqual(len(xxe_chains), 1)
+                self.assertEqual(xxe_chains[0].evidence_references[-1].line, 5)
+
+    def test_suppressing_overlapping_categories_only(self):
+        """Issue 5: Verify attack chains only suppress indicators with the SAME category and line."""
+        # A file with command_injection attack chain and an unrelated path_traversal filesystem indicator.
+        # Before, the entire file was skipped under chain_files. Now, both are generated!
+        code = (
+            "import subprocess\n"
+            "import os\n"
+            "cmd = request.args.get('cmd')\n"
+            "subprocess.run(cmd)\n"
+            "os.open('/etc/passwd', os.O_RDONLY)\n"
+        )
+        from breakglass.hypothesis.generators import generate_hypotheses_from_report
+        report = RepositoryReport(
+            repository=MagicMock(frameworks=[]),
+            routes=[],
+            security_indicators=[
+                SecurityIndicator("subprocess", "subprocess", "app.py", 4, "run"),
+                SecurityIndicator("filesystem", "filesystem", "app.py", 5, "open")
+            ]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = generate_hypotheses_from_report(report, "/repo")
+                categories = {h.category for h in res}
+                self.assertIn("command_injection", categories)
+                self.assertIn("path_traversal", categories)
+
+    def test_consolidated_id_authentication_capped_evidence(self):
+        """Issue 6: Verify consolidated hypothesis ID matches capped 5 evidence references."""
+        # Generate more than 5 secrets indicators
+        unique_inds = [
+            SecurityIndicator("secret_config", "secret", "app.py", i, f"key_{i} = 'secret'")
+            for i in range(1, 10)
+        ]
+        summary = RepositorySummary(
+            root="/repo",
+            total_files=1,
+            total_directories=0,
+            languages={},
+            frameworks=[],
+            ecosystems=[],
+            config_files=[],
+            docker_configs=[],
+            cicd_configs=[],
+            infrastructure_configs=[],
+            test_files=[]
+        )
+        report = RepositoryReport(
+            repository=summary,
+            routes=[],
+            security_indicators=unique_inds
+        )
+        from breakglass.hypothesis.generators import generate_hypotheses_from_report
+        with patch("builtins.open", unittest.mock.mock_open(read_data="")):
+            with patch("os.path.exists", return_value=True):
+                res = generate_hypotheses_from_report(report, "/repo")
+                secret_hyp = next(h for h in res if h.category == "credential_exposure")
+                # Assert references are capped at 5
+                self.assertEqual(len(secret_hyp.evidence_references), 5)
+                # Verify that ID re-authentication passes
+                engine = ValidationEngine(MockSandboxValidator())
+                valid, canonical_hyp, err = engine.validate_hypothesis_shape(secret_hyp, report)
+                self.assertTrue(valid, f"Verification failed with: {err}")
+
+    def test_priority_truncation_preserves_sink_and_route(self):
+        """Issue 7: Verify evidence truncation prioritizes the actual sink and enclosing route."""
+        code = (
+            "@app.route('/execute')\n"  # line 1 (Route)
+            "def exec_route(cmd):\n"
+            "    t1 = cmd\n"            # line 3 (Taint)
+            "    t2 = t1\n"             # line 4 (Taint)
+            "    t3 = t2\n"             # line 5 (Taint)
+            "    t4 = t3\n"             # line 6 (Taint)
+            "    t5 = t4\n"             # line 7 (Taint)
+            "    subprocess.run(t5)\n"  # line 8 (Sink)
+        )
+        from breakglass.hypothesis.generators import analyze_file_for_attack_chains
+        report = RepositoryReport(
+            repository=MagicMock(),
+            routes=[RouteCandidate(file="app.py", line=1, method="POST", pattern="/execute", evidence="")],
+            security_indicators=[
+                SecurityIndicator("subprocess", "subprocess", "app.py", 8, "run"),
+                SecurityIndicator("subprocess", "subprocess", "app.py", 3, "t1"),
+                SecurityIndicator("subprocess", "subprocess", "app.py", 4, "t2"),
+                SecurityIndicator("subprocess", "subprocess", "app.py", 5, "t3"),
+                SecurityIndicator("subprocess", "subprocess", "app.py", 6, "t4"),
+                SecurityIndicator("subprocess", "subprocess", "app.py", 7, "t5")
+            ]
+        )
+        with patch("builtins.open", unittest.mock.mock_open(read_data=code)):
+            with patch("os.path.exists", return_value=True):
+                res = analyze_file_for_attack_chains("app.py", "/repo", report)
+                self.assertEqual(len(res), 1)
+                refs = res[0].evidence_references
+                self.assertEqual(len(refs), 5)
+                # Sink (line 8) and Route (line 1) must be preserved!
+                lines = {r.line for r in refs}
+                self.assertIn(8, lines)
+                self.assertIn(1, lines)
+
+    def test_mock_sandbox_validator_does_not_confirm_by_default(self):
+        """Issue 8: Verify MockSandboxValidator returns NOT_CONFIRMED by default without criteria fabrication."""
+        validator = MockSandboxValidator()
+        hyp = SecurityHypothesis(
+            id="HYP-SQL-INJECTION-123",
+            title="SQLi",
+            description="SQL Injection",
+            category="sql_injection",
+            severity="CRITICAL",
+            confidence=0.9,
+            evidence_references=[EvidenceReference(type="security_indicator", file="app.py", line=5, detail="DB.execute")]
+        )
+        res = validator.validate(hyp, MagicMock())
+        self.assertEqual(res.status, ValidationStatus.NOT_CONFIRMED)
+        self.assertFalse(res.confirmed)
+

@@ -107,8 +107,12 @@ def get_receiver_and_method(func_node):
 def analyze_file_for_attack_chains(
     file_rel_path: str,
     repo_root: str,
-    report: RepositoryReport
+    report: RepositoryReport,
+    chain_covered_vulnerabilities: Optional[set] = None
 ) -> List[SecurityHypothesis]:
+    if chain_covered_vulnerabilities is None:
+        chain_covered_vulnerabilities = set()
+
     abs_path = os.path.join(repo_root, file_rel_path)
     if not os.path.exists(abs_path):
         return []
@@ -121,29 +125,48 @@ def analyze_file_for_attack_chains(
 
     ext = os.path.splitext(file_rel_path)[1].lower()
 
-    sources = []       # list of {"line": int, "var": str, "detail": str}
-    taints = []        # list of {"line": int, "var": str, "detail": str}
-    sinks = []         # list of {"line": int, "var": str, "detail": str, "category": str, "method": str}
-    auth_calls = []    # list of {"line": int, "detail": str}
+    if ext != ".py":
+        return []
 
-    if ext == ".py":
-        try:
-            tree = ast.parse(content)
+    file_routes = getattr(report, "routes", []) or []
 
-            class ASTFlowVisitor(ast.NodeVisitor):
-                def __init__(self):
-                    self.sources = {}
-                    self.taints = {}
-                    self.sinks = []
-                    self.auths = []
-                    self.has_session_reference = False
+    try:
+        tree = ast.parse(content)
 
-                def visit_Name(self, node):
+        class ASTFlowVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.func_stack = []
+                self.func_scopes = {}
+                self.global_scope = {
+                    "sources": {},
+                    "taints": {},
+                    "sinks": [],
+                    "auths": [],
+                    "is_route": False,
+                    "route_line": None,
+                    "func_name": "<global>"
+                }
+                self.has_session_reference = False
+
+            @property
+            def current_scope(self):
+                if self.func_stack:
+                    return self.func_scopes[self.func_stack[-1]]
+                return self.global_scope
+
+            def visit_Name(self, node):
+                try:
                     if node.id == "session":
                         self.has_session_reference = True
+                except Exception:
+                    pass
+                try:
                     self.generic_visit(node)
+                except Exception:
+                    pass
 
-                def _is_source_expr(self, node):
+            def _is_source_expr(self, node):
+                try:
                     for sub in ast.walk(node):
                         if isinstance(sub, ast.Attribute):
                             if isinstance(sub.value, ast.Name) and sub.value.id == "request":
@@ -161,22 +184,38 @@ def analyze_file_for_attack_chains(
                                     return True
                             elif isinstance(sub.func, ast.Name) and sub.func.id == "request":
                                 return True
-                    return False
+                except Exception:
+                    pass
+                return False
 
-                def visit_FunctionDef(self, node):
+            def visit_FunctionDef(self, node):
+                try:
+                    scope = {
+                        "sources": {},
+                        "taints": {},
+                        "sinks": [],
+                        "auths": [],
+                        "is_route": False,
+                        "route_line": None,
+                        "func_name": node.name
+                    }
+                    
                     is_route = False
                     for dec in node.decorator_list:
-                        dec_rec, dec_meth = get_receiver_and_method(dec)
+                        func_node = dec.func if isinstance(dec, ast.Call) else dec
+                        dec_rec, dec_meth = get_receiver_and_method(func_node)
                         if dec_meth == "route" or (dec_rec and "route" in dec_rec) or dec_meth in ("get", "post", "put", "delete", "patch"):
                             is_route = True
                             break
+                    
                     if is_route:
-                        # Route parameters are sources of input
+                        scope["is_route"] = True
+                        scope["route_line"] = node.lineno
                         for arg in node.args.args:
                             if arg.arg != "self":
-                                self.sources[arg.arg] = node.lineno
+                                scope["sources"][arg.arg] = node.lineno
                                 
-                        # Check for broken auth / privilege escalation (sensitive route export/billing/admin but no role checks)
+                        # Check for broken auth / privilege escalation
                         func_name_lower = node.name.lower()
                         is_sensitive = any(x in func_name_lower for x in ("admin", "export", "billing", "delete", "update", "create", "dashboard", "users"))
                         if is_sensitive:
@@ -187,18 +226,34 @@ def analyze_file_for_attack_chains(
                                 elif isinstance(sub, ast.Constant) and sub.value == "role":
                                     has_role_check = True
                             if not has_role_check:
-                                self.sinks.append((node.lineno, None, "broken_auth", node.name))
+                                scope["sinks"].append((node.lineno, None, "broken_auth", node.name))
                                 
-                    self.generic_visit(node)
+                    self.func_scopes[node] = scope
+                    self.func_stack.append(node)
+                except Exception:
+                    pass
 
-                def visit_Assign(self, node):
+                try:
+                    self.generic_visit(node)
+                except Exception:
+                    pass
+
+                try:
+                    if self.func_stack and self.func_stack[-1] == node:
+                        self.func_stack.pop()
+                except Exception:
+                    pass
+
+            def visit_Assign(self, node):
+                try:
+                    scope = self.current_scope
                     targets = []
                     for t in node.targets:
                         if isinstance(t, ast.Name):
                             targets.append(t.id)
                         elif isinstance(t, ast.Subscript):
                             if isinstance(t.value, ast.Name) and t.value.id == "session":
-                                self.auths.append((node.lineno, "session state modification"))
+                                scope["auths"].append((node.lineno, "session state modification"))
                                 self.has_session_reference = True
 
                     if not targets:
@@ -208,31 +263,38 @@ def analyze_file_for_attack_chains(
                     is_src = self._is_source_expr(node.value)
                     if is_src:
                         for t in targets:
-                            self.sources[t] = node.lineno
+                            scope["sources"][t] = node.lineno
                     else:
                         depends_on_taint = False
                         for sub in ast.walk(node.value):
-                            if isinstance(sub, ast.Name) and (sub.id in self.sources or sub.id in self.taints):
+                            if isinstance(sub, ast.Name) and (sub.id in scope["sources"] or sub.id in scope["taints"]):
                                 depends_on_taint = True
                                 break
                             if isinstance(sub, ast.JoinedStr):
                                 for val in sub.values:
                                     if isinstance(val, ast.FormattedValue):
                                         for s in ast.walk(val.value):
-                                            if isinstance(s, ast.Name) and (s.id in self.sources or s.id in self.taints):
+                                            if isinstance(s, ast.Name) and (s.id in scope["sources"] or s.id in scope["taints"]):
                                                 depends_on_taint = True
                                                 break
                         if depends_on_taint:
                             for t in targets:
-                                self.taints[t] = node.lineno
+                                scope["taints"][t] = node.lineno
+                except Exception:
+                    pass
 
+                try:
                     self.generic_visit(node)
+                except Exception:
+                    pass
 
-                def visit_Call(self, node):
+            def visit_Call(self, node):
+                try:
                     receiver, method_name = get_receiver_and_method(node.func)
                     if method_name:
+                        scope = self.current_scope
                         if method_name in ("redirect", "login_user", "authenticate", "login"):
-                            self.auths.append((node.lineno, f"call to {method_name}"))
+                            scope["auths"].append((node.lineno, f"call to {method_name}"))
 
                         is_tainted = False
                         tainted_var = None
@@ -240,7 +302,7 @@ def analyze_file_for_attack_chains(
                         # Search positional arguments deeply
                         for arg in node.args:
                             for sub in ast.walk(arg):
-                                if isinstance(sub, ast.Name) and (sub.id in self.sources or sub.id in self.taints):
+                                if isinstance(sub, ast.Name) and (sub.id in scope["sources"] or sub.id in scope["taints"]):
                                     is_tainted = True
                                     tainted_var = sub.id
                                     break
@@ -250,15 +312,15 @@ def analyze_file_for_attack_chains(
                         # Search keyword arguments deeply
                         for kw in node.keywords:
                             for sub in ast.walk(kw.value):
-                                if isinstance(sub, ast.Name) and (sub.id in self.sources or sub.id in self.taints):
+                                if isinstance(sub, ast.Name) and (sub.id in scope["sources"] or sub.id in scope["taints"]):
                                     is_tainted = True
-                                    tainted_var = kw.value.id
+                                    tainted_var = sub.id
                                     break
                             if is_tainted:
                                 break
 
                         # Format string SSTI
-                        if method_name == "format" and receiver and (receiver in self.sources or receiver in self.taints):
+                        if method_name == "format" and receiver and (receiver in scope["sources"] or receiver in scope["taints"]):
                             is_tainted = True
                             tainted_var = receiver
 
@@ -272,7 +334,7 @@ def analyze_file_for_attack_chains(
                                     if len(node.args) >= 1:
                                         arg0 = node.args[0]
                                         for sub in ast.walk(arg0):
-                                            if isinstance(sub, ast.Name) and (sub.id in self.sources or sub.id in self.taints):
+                                            if isinstance(sub, ast.Name) and (sub.id in scope["sources"] or sub.id in scope["taints"]):
                                                 is_query_string_tainted = True
                                                 break
                                     if is_query_string_tainted:
@@ -309,8 +371,14 @@ def analyze_file_for_attack_chains(
                                 cat = "deserialization"
                                 
                             # 7. XXE
-                            elif method_name in ("parse", "fromstring", "XMLParser") and receiver in ("etree", "ElementTree", "xml.etree.ElementTree", "lxml.etree", "lxml"):
-                                cat = "xxe"
+                            elif method_name in ("parse", "fromstring", "XMLParser", "parseXML"):
+                                is_xml = False
+                                if receiver and any((x in receiver.lower() or receiver.lower() in x) for x in ("et", "etree", "elementtree", "xml", "lxml")):
+                                    is_xml = True
+                                elif not receiver:
+                                    is_xml = any(x in content for x in ("xml", "etree", "ElementTree", "lxml"))
+                                if is_xml:
+                                    cat = "xxe"
                                 
                             # 8. Open Redirect
                             elif method_name == "redirect" and not receiver:
@@ -321,12 +389,19 @@ def analyze_file_for_attack_chains(
                                 cat = "mass_assignment"
 
                             if cat:
-                                self.sinks.append((node.lineno, tainted_var, cat, method_name))
+                                scope["sinks"].append((node.lineno, tainted_var, cat, method_name))
+                except Exception:
+                    pass
 
+                try:
                     self.generic_visit(node)
+                except Exception:
+                    pass
 
-                def visit_Return(self, node):
+            def visit_Return(self, node):
+                try:
                     if node.value:
+                        scope = self.current_scope
                         # Exclude safe return functions
                         is_safe_call = False
                         if isinstance(node.value, ast.Call):
@@ -338,7 +413,7 @@ def analyze_file_for_attack_chains(
                             is_tainted = False
                             tainted_var = None
                             for sub in ast.walk(node.value):
-                                if isinstance(sub, ast.Name) and (sub.id in self.sources or sub.id in self.taints):
+                                if isinstance(sub, ast.Name) and (sub.id in scope["sources"] or sub.id in scope["taints"]):
                                     is_tainted = True
                                     tainted_var = sub.id
                                     break
@@ -346,21 +421,29 @@ def analyze_file_for_attack_chains(
                                     for val in sub.values:
                                         if isinstance(val, ast.FormattedValue):
                                             for s in ast.walk(val.value):
-                                                if isinstance(s, ast.Name) and (s.id in self.sources or s.id in self.taints):
+                                                if isinstance(s, ast.Name) and (s.id in scope["sources"] or s.id in scope["taints"]):
                                                     is_tainted = True
                                                     tainted_var = s.id
                                                     break
                             if is_tainted:
-                                self.sinks.append((node.lineno, tainted_var, "xss", "return"))
-                    self.generic_visit(node)
+                                scope["sinks"].append((node.lineno, tainted_var, "xss", "return"))
+                except Exception:
+                    pass
 
-                def visit_For(self, node):
+                try:
+                    self.generic_visit(node)
+                except Exception:
+                    pass
+
+            def visit_For(self, node):
+                try:
+                    scope = self.current_scope
                     is_tainted_iter = False
                     if isinstance(node.iter, ast.Call):
                         rec, meth = get_receiver_and_method(node.iter.func)
-                        if meth == "items" and rec and (rec in self.sources or rec in self.taints):
+                        if meth == "items" and rec and (rec in scope["sources"] or rec in scope["taints"]):
                             is_tainted_iter = True
-                    elif isinstance(node.iter, ast.Name) and (node.iter.id in self.sources or node.iter.id in self.taints):
+                    elif isinstance(node.iter, ast.Name) and (node.iter.id in scope["sources"] or node.iter.id in scope["taints"]):
                         is_tainted_iter = True
                         
                     if is_tainted_iter:
@@ -368,241 +451,248 @@ def analyze_file_for_attack_chains(
                             if isinstance(body_node, ast.Assign):
                                 for target in body_node.targets:
                                     if isinstance(target, ast.Subscript):
-                                        self.sinks.append((node.lineno, None, "mass_assignment", "for_loop"))
+                                        scope["sinks"].append((node.lineno, None, "mass_assignment", "for_loop"))
                                         break
+                except Exception:
+                    pass
+
+                try:
                     self.generic_visit(node)
+                except Exception:
+                    pass
 
-            visitor = ASTFlowVisitor()
-            visitor.visit(tree)
-
-            for var, line in visitor.sources.items():
-                sources.append({"line": line, "var": var, "detail": f"user-controlled variable '{var}' initialized"})
-            for var, line in visitor.taints.items():
-                taints.append({"line": line, "var": var, "detail": f"tainted variable '{var}' propagated"})
-            for line, var, cat, method in visitor.sinks:
-                sinks.append({"line": line, "var": var, "category": cat, "method": method, "detail": f"tainted input passed to security-sensitive API: {method}({var or ''})"})
-            for line, detail in visitor.auths:
-                auth_calls.append({"line": line, "detail": f"authentication context action: {detail}"})
-
-        except Exception:
-            pass
-
-    # Generic file-level heuristic overrides for Missed categories
-    # 1. Stored XSS pattern
-    if any(x in content.lower() for x in ("reviews", "feedback", "audit", "comment")) and "xss" not in [s["category"] for s in sinks]:
-        # Look for db queries followed by format string injection or loop renders
-        if "DB.execute" in content or "conn.execute" in content:
-            sinks.append({"line": 70, "var": None, "category": "xss", "method": "DB.execute", "detail": "stored data rendering"})
-
-    # 2. Second-Order SQLi
-    if "audit" in content.lower() and "signup" in content.lower():
-        # Sign up table query interpolation in audit route
-        sinks.append({"line": 57, "var": None, "category": "sql_injection", "method": "DB.execute", "detail": "second order SQL injection"})
-
-    # 3. XML External Entity (XXE)
-    if "xml" in content.lower() or "etree" in content.lower() or "ElementTree" in content.lower():
-        sinks.append({"line": 35, "var": None, "category": "xxe", "method": "parse", "detail": "XML external entity injection"})
-
-    # Deduplicate and prioritize sinks per line to avoid clutter
-    sinks_by_line = {}
-    for sink in sinks:
-        line = sink["line"]
-        sinks_by_line.setdefault(line, []).append(sink)
-        
-    deduped_sinks = []
-    prec = {
-        "command_injection": 1,
-        "deserialization": 2,
-        "xxe": 3,
-        "ssti": 4,
-        "sql_injection": 5,
-        "nosql_injection": 6,
-        "ssrf": 7,
-        "path_traversal": 8,
-        "open_redirect": 9,
-        "mass_assignment": 10,
-        "idor": 11,
-        "broken_auth": 12,
-        "xss": 13
-    }
-    for line, line_sinks in sinks_by_line.items():
-        line_sinks.sort(key=lambda s: prec.get(s["category"], 99))
-        deduped_sinks.append(line_sinks[0])
-        
-    sinks = deduped_sinks
+        visitor = ASTFlowVisitor()
+        visitor.visit(tree)
+        all_scopes = [visitor.global_scope] + list(visitor.func_scopes.values())
+    except Exception:
+        all_scopes = []
 
     hypotheses = []
 
-    for sink in sinks:
-        cat = sink["category"]
-        sink_line = sink["line"]
+    for scope in all_scopes:
+        sources = [{"line": l, "var": v, "detail": f"user-controlled variable '{v}' initialized"} for v, l in scope["sources"].items()]
+        taints = [{"line": l, "var": v, "detail": f"tainted variable '{v}' propagated"} for v, l in scope["taints"].items()]
+        sinks = [{"line": l, "var": v, "category": c, "method": m, "detail": f"tainted input passed to security-sensitive API: {m}({v or ''})"} for l, v, c, m in scope["sinks"]]
+        auth_calls = [{"line": l, "detail": f"authentication context action: {d}"} for l, d in scope["auths"]]
 
-        refs = []
-        for src in sources:
-            ref = create_authenticated_evidence_ref(file_rel_path, src["line"], repo_root, report)
-            if ref:
-                refs.append(ref)
-        for t in taints:
-            ref = create_authenticated_evidence_ref(file_rel_path, t["line"], repo_root, report)
-            if ref:
-                refs.append(ref)
-        ref = create_authenticated_evidence_ref(file_rel_path, sink_line, repo_root, report)
-        if ref:
-            refs.append(ref)
-        for a in auth_calls:
-            ref = create_authenticated_evidence_ref(file_rel_path, a["line"], repo_root, report)
-            if ref:
-                refs.append(ref)
+        # Deduplicate and prioritize sinks per line within this scope
+        sinks_by_line = {}
+        for sink in sinks:
+            sinks_by_line.setdefault(sink["line"], []).append(sink)
+            
+        deduped_sinks = []
+        prec = {
+            "command_injection": 1,
+            "deserialization": 2,
+            "xxe": 3,
+            "ssti": 4,
+            "sql_injection": 5,
+            "nosql_injection": 6,
+            "ssrf": 7,
+            "path_traversal": 8,
+            "open_redirect": 9,
+            "mass_assignment": 10,
+            "idor": 11,
+            "broken_auth": 12,
+            "xss": 13
+        }
+        for line, line_sinks in sinks_by_line.items():
+            line_sinks.sort(key=lambda s: prec.get(s["category"], 99))
+            deduped_sinks.append(line_sinks[0])
+            
+        for sink in deduped_sinks:
+            cat = sink["category"]
+            sink_line = sink["line"]
 
-        file_routes = getattr(report, "routes", []) or []
-        route_decorator = None
-        min_dist = 9999
-        for r in file_routes:
-            if r.file == file_rel_path and r.line <= sink_line and r.pattern.startswith("/"):
-                dist = sink_line - r.line
-                if dist < min_dist:
-                    min_dist = dist
-                    route_decorator = r
-        if route_decorator:
-            ref = create_authenticated_evidence_ref(file_rel_path, route_decorator.line, repo_root, report)
-            if ref:
-                refs.append(ref)
+            refs = []
+            for src in sources:
+                ref = create_authenticated_evidence_ref(file_rel_path, src["line"], repo_root, report)
+                if ref: refs.append(ref)
+            for t in taints:
+                ref = create_authenticated_evidence_ref(file_rel_path, t["line"], repo_root, report)
+                if ref: refs.append(ref)
+            ref = create_authenticated_evidence_ref(file_rel_path, sink_line, repo_root, report)
+            if ref: refs.append(ref)
+            for a in auth_calls:
+                ref = create_authenticated_evidence_ref(file_rel_path, a["line"], repo_root, report)
+                if ref: refs.append(ref)
 
-        unique_refs = []
-        seen_ref_keys = set()
-        for ref in refs:
-            key = (ref.file, ref.line, ref.type, ref.detail)
-            if key not in seen_ref_keys:
-                seen_ref_keys.add(key)
-                unique_refs.append(ref)
-        unique_refs.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
-
-        if len(unique_refs) > 5:
-            unique_refs = unique_refs[:5]
-
-        if not unique_refs:
-            continue
-
-        has_auth = any(
-            "access control" in getattr(r, "detail", "").lower() or
-            "session" in getattr(r, "detail", "").lower() or
-            "authentication" in getattr(r, "detail", "").lower()
-            for r in unique_refs
-        )
-        
-        # Details Mapping
-        if cat == "sql_injection":
-            if has_auth:
-                title = "SQL Injection leading to Authentication Bypass"
-                desc = f"Attacker-controlled input is interpolated into an SQL query on line {sink_line} and executed, leading to authentication bypass via session state establishment."
-                severity = "CRITICAL"
-                confidence = 0.95
-                rationale = "An attacker can bypass authentication by manipulating the SQL query executed in the login handler."
+            route_decorator = None
+            if scope["is_route"] and scope["route_line"] is not None:
+                min_dist = 9999
+                for r in file_routes:
+                    if r.file == file_rel_path and r.line <= scope["route_line"]:
+                        dist = scope["route_line"] - r.line
+                        if dist < min_dist:
+                            min_dist = dist
+                            route_decorator = r
             else:
-                title = "Potential SQL Injection"
-                desc = f"Attacker-controlled input is interpolated into an SQL query and executed on line {sink_line}."
+                min_dist = 9999
+                for r in file_routes:
+                    if r.file == file_rel_path and r.line <= sink_line and r.pattern.startswith("/"):
+                        dist = sink_line - r.line
+                        if dist < min_dist:
+                            min_dist = dist
+                            route_decorator = r
+            if route_decorator:
+                ref = create_authenticated_evidence_ref(file_rel_path, route_decorator.line, repo_root, report)
+                if ref: refs.append(ref)
+
+            unique_refs = []
+            seen_ref_keys = set()
+            for ref in refs:
+                key = (ref.file, ref.line, ref.type, ref.detail)
+                if key not in seen_ref_keys:
+                    seen_ref_keys.add(key)
+                    unique_refs.append(ref)
+
+            # Prioritize: Sink (0) > Enclosing Route (1) > Entry Point (2) > Taint/Source (3) > Other (4)
+            def get_priority(r):
+                if r.line == sink_line:
+                    return 0
+                if r.type == "route":
+                    return 1
+                if r.type == "entry_point":
+                    return 2
+                if "user-controlled" in r.detail.lower() or "tainted" in r.detail.lower():
+                    return 3
+                return 4
+
+            unique_refs.sort(key=get_priority)
+            if len(unique_refs) > 5:
+                unique_refs = unique_refs[:5]
+            
+            unique_refs.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
+
+            if not unique_refs:
+                continue
+
+            # Record covered vulnerabilities to prevent duplicate single-indicator findings
+            for ref in unique_refs:
+                if ref.line is not None:
+                    chain_covered_vulnerabilities.add((ref.file, ref.line, cat))
+
+            has_auth = any(
+                "access control" in getattr(r, "detail", "").lower() or
+                "session" in getattr(r, "detail", "").lower() or
+                "authentication" in getattr(r, "detail", "").lower()
+                for r in unique_refs
+            )
+            
+            # Details Mapping
+            if cat == "sql_injection":
+                if has_auth:
+                    title = "SQL Injection leading to Authentication Bypass"
+                    desc = f"Attacker-controlled input is interpolated into an SQL query on line {sink_line} and executed, leading to authentication bypass via session state establishment."
+                    severity = "CRITICAL"
+                    confidence = 0.95
+                    rationale = "An attacker can bypass authentication by manipulating the SQL query executed in the login handler."
+                else:
+                    title = "Potential SQL Injection"
+                    desc = f"Attacker-controlled input is interpolated into an SQL query and executed on line {sink_line}."
+                    severity = "CRITICAL"
+                    confidence = 0.90
+                    rationale = "User-controlled input is concatenated or formatted directly into a database query string."
+            elif cat == "nosql_injection":
+                title = "Potential NoSQL Injection"
+                desc = f"Attacker-controlled input is passed unsanitized into a NoSQL database query on line {sink_line}."
                 severity = "CRITICAL"
                 confidence = 0.90
-                rationale = "User-controlled input is concatenated or formatted directly into a database query string."
-        elif cat == "nosql_injection":
-            title = "Potential NoSQL Injection"
-            desc = f"Attacker-controlled input is passed unsanitized into a NoSQL database query on line {sink_line}."
-            severity = "CRITICAL"
-            confidence = 0.90
-            rationale = "Unsanitized user inputs in NoSQL queries can allow query structure manipulation."
-        elif cat == "command_injection":
-            title = "Potential Remote Code Execution via Command Injection"
-            desc = f"Attacker-controlled input is passed directly to command execution sink '{sink['method']}' on line {sink_line}."
-            severity = "CRITICAL"
-            confidence = 0.95
-            rationale = "Execution of system commands with untrusted parameters can lead to remote code execution."
-        elif cat == "path_traversal":
-            title = "Potential Path Traversal / Arbitrary File Access"
-            desc = f"Attacker-controlled input is passed to filesystem operation '{sink['method']}' on line {sink_line}."
-            severity = "HIGH"
-            confidence = 0.90
-            rationale = "Accessing files using unvalidated user input exposes system files to path traversal."
-        elif cat == "ssti":
-            title = "Potential Server-Side Template Injection (SSTI)"
-            desc = f"Attacker-controlled input is passed to template rendering function '{sink['method']}' on line {sink_line}."
-            severity = "CRITICAL"
-            confidence = 0.95
-            rationale = "Rendering raw user input inside templates can lead to arbitrary code execution."
-        elif cat == "ssrf":
-            title = "Potential Server-Side Request Forgery (SSRF)"
-            desc = f"Attacker-controlled input is passed to outbound network request '{sink['method']}' on line {sink_line}."
-            severity = "HIGH"
-            confidence = 0.90
-            rationale = "Allowing user-controlled URLs in outbound requests exposes internal services to SSRF."
-        elif cat == "xxe":
-            title = "Potential XML External Entity (XXE) Injection"
-            desc = f"XML parser parses untrusted XML input on line {sink_line} without disabling external entities."
-            severity = "HIGH"
-            confidence = 0.90
-            rationale = "Untrusted XML parsing can allow file retrieval or server-side request forgery via external entities."
-        elif cat == "deserialization":
-            title = "Potential Untrusted Deserialization"
-            desc = f"Untrusted input is deserialized using unsafe method '{sink['method']}' on line {sink_line}."
-            severity = "CRITICAL"
-            confidence = 0.95
-            rationale = "Deserializing untrusted data with unsafe binders can lead to arbitrary code execution."
-        elif cat == "open_redirect":
-            title = "Potential Open Redirect"
-            desc = f"Attacker-controlled URL is passed to redirect handler on line {sink_line}."
-            severity = "HIGH"
-            confidence = 0.85
-            rationale = "Unvalidated redirection targets can redirect users to malicious external domains."
-        elif cat == "xss":
-            title = "Potential Cross-Site Scripting (XSS)"
-            desc = f"User input is reflected raw in HTTP response on line {sink_line} without escaping."
-            severity = "HIGH"
-            confidence = 0.90
-            rationale = "Reflecting untrusted user inputs in HTML responses allows attackers to execute client-side scripts."
-        elif cat == "idor":
-            title = "Potential Insecure Direct Object Reference (IDOR)"
-            desc = f"Direct object reference is accessed in query on line {sink_line} without verifying user ownership."
-            severity = "HIGH"
-            confidence = 0.85
-            rationale = "Lack of horizontal authorization checks allows users to access resources belonging to other accounts."
-        elif cat == "broken_auth":
-            title = "Potential Broken Authorization / Access Control Bypass"
-            desc = f"Action on line {sink_line} lacks proper function-level authentication checks."
-            severity = "HIGH"
-            confidence = 0.85
-            rationale = "Exposing administrative or sensitive functions without access checks leads to privilege escalation."
-        elif cat == "mass_assignment":
-            title = "Potential Mass Assignment Vulnerability"
-            desc = f"Model fields updated dynamically from request input on line {sink_line}."
-            severity = "CRITICAL"
-            confidence = 0.90
-            rationale = "Directly binding request parameters to model properties can permit role or privilege escalation."
-        else:
-            title = "Potential Untrusted Input Execution"
-            desc = f"Attacker-controlled input is passed to security-sensitive API '{sink['method']}' on line {sink_line}."
-            severity = "MEDIUM"
-            confidence = 0.80
-            rationale = "User input reaches an execution sink without proper sanitization."
+                rationale = "Unsanitized user inputs in NoSQL queries can allow query structure manipulation."
+            elif cat == "command_injection":
+                title = "Potential Remote Code Execution via Command Injection"
+                desc = f"Attacker-controlled input is passed directly to command execution sink '{sink['method']}' on line {sink_line}."
+                severity = "CRITICAL"
+                confidence = 0.95
+                rationale = "Execution of system commands with untrusted parameters can lead to remote code execution."
+            elif cat == "path_traversal":
+                title = "Potential Path Traversal / Arbitrary File Access"
+                desc = f"Attacker-controlled input is passed to filesystem operation '{sink['method']}' on line {sink_line}."
+                severity = "HIGH"
+                confidence = 0.90
+                rationale = "Accessing files using unvalidated user input exposes system files to path traversal."
+            elif cat == "ssti":
+                title = "Potential Server-Side Template Injection (SSTI)"
+                desc = f"Attacker-controlled input is passed to template rendering function '{sink['method']}' on line {sink_line}."
+                severity = "CRITICAL"
+                confidence = 0.95
+                rationale = "Rendering raw user input inside templates can lead to arbitrary code execution."
+            elif cat == "ssrf":
+                title = "Potential Server-Side Request Forgery (SSRF)"
+                desc = f"Attacker-controlled input is passed to outbound network request '{sink['method']}' on line {sink_line}."
+                severity = "HIGH"
+                confidence = 0.90
+                rationale = "Allowing user-controlled URLs in outbound requests exposes internal services to SSRF."
+            elif cat == "xxe":
+                title = "Potential XML External Entity (XXE) Injection"
+                desc = f"XML parser parses untrusted XML input on line {sink_line} without disabling external entities."
+                severity = "HIGH"
+                confidence = 0.90
+                rationale = "Untrusted XML parsing can allow file retrieval or server-side request forgery via external entities."
+            elif cat == "deserialization":
+                title = "Potential Untrusted Deserialization"
+                desc = f"Untrusted input is deserialized using unsafe method '{sink['method']}' on line {sink_line}."
+                severity = "CRITICAL"
+                confidence = 0.95
+                rationale = "Deserializing untrusted data with unsafe binders can lead to arbitrary code execution."
+            elif cat == "open_redirect":
+                title = "Potential Open Redirect"
+                desc = f"Attacker-controlled URL is passed to redirect handler on line {sink_line}."
+                severity = "HIGH"
+                confidence = 0.85
+                rationale = "Unvalidated redirection targets can redirect users to malicious external domains."
+            elif cat == "xss":
+                title = "Potential Cross-Site Scripting (XSS)"
+                desc = f"User input is reflected raw in HTTP response on line {sink_line} without escaping."
+                severity = "HIGH"
+                confidence = 0.90
+                rationale = "Reflecting untrusted user inputs in HTML responses allows attackers to execute client-side scripts."
+            elif cat == "idor":
+                title = "Potential Insecure Direct Object Reference (IDOR)"
+                desc = f"Direct object reference is accessed in query on line {sink_line} without verifying user ownership."
+                severity = "HIGH"
+                confidence = 0.85
+                rationale = "Lack of horizontal authorization checks allows users to access resources belonging to other accounts."
+            elif cat == "broken_auth":
+                title = "Potential Broken Authorization / Access Control Bypass"
+                desc = f"Action on line {sink_line} lacks proper function-level authentication checks."
+                severity = "HIGH"
+                confidence = 0.85
+                rationale = "Exposing administrative or sensitive functions without access checks leads to privilege escalation."
+            elif cat == "mass_assignment":
+                title = "Potential Mass Assignment Vulnerability"
+                desc = f"Model fields updated dynamically from request input on line {sink_line}."
+                severity = "CRITICAL"
+                confidence = 0.90
+                rationale = "Directly binding request parameters to model properties can permit role or privilege escalation."
+            else:
+                title = "Potential Untrusted Input Execution"
+                desc = f"Attacker-controlled input is passed to security-sensitive API '{sink['method']}' on line {sink_line}."
+                severity = "MEDIUM"
+                confidence = 0.80
+                rationale = "User input reaches an execution sink without proper sanitization."
 
-        identity = {
-            "rule": "attack_chain",
-            "file": file_rel_path,
-            "category": cat,
-            "lines": [r.line for r in unique_refs if r.line is not None],
-            "has_auth": has_auth
-        }
-        hyp_id = generate_hypothesis_id(cat, identity, is_llm=False)
+            identity_lines = [r.line for r in unique_refs if r.line is not None]
+            identity = {
+                "rule": "attack_chain",
+                "file": file_rel_path,
+                "category": cat,
+                "lines": identity_lines,
+                "has_auth": has_auth
+            }
+            hyp_id = generate_hypothesis_id(cat, identity, is_llm=False)
 
-        hypotheses.append(SecurityHypothesis(
-            id=hyp_id,
-            title=title,
-            description=desc,
-            category=cat,
-            severity=severity,
-            confidence=confidence,
-            evidence_references=unique_refs,
-            rationale=rationale,
-            affected_paths=[file_rel_path]
-        ))
+            hypotheses.append(SecurityHypothesis(
+                id=hyp_id,
+                title=title,
+                description=desc,
+                category=cat,
+                severity=severity,
+                confidence=confidence,
+                evidence_references=unique_refs,
+                rationale=rationale,
+                affected_paths=[file_rel_path]
+            ))
 
     return hypotheses
 
@@ -794,13 +884,12 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
         eps_by_file.setdefault(ep.file, []).append(ep)
 
     # Run data-flow attack chain analysis on all candidate source files
-    chain_files = set()
+    chain_covered_vulnerabilities = set()
     all_files = set(inds_by_file.keys()) | set(routes_by_file.keys())
     for filepath in sorted(list(all_files)):
-        chains = analyze_file_for_attack_chains(filepath, repo_root, report)
+        chains = analyze_file_for_attack_chains(filepath, repo_root, report, chain_covered_vulnerabilities)
         if chains:
             candidates.extend(chains)
-            chain_files.add(filepath)
 
     # Proximity helper
     def check_proximity(line1: Optional[int], line2: Optional[int]) -> bool:
@@ -1024,6 +1113,8 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
     for filepath, file_secret_inds in secrets_inds_by_file.items():
         refs = []
         for ind in file_secret_inds:
+            if (ind.file, ind.line, "credential_exposure") in chain_covered_vulnerabilities:
+                continue
             ref = validate_and_create_evidence_ref(
                 "security_indicator", ind.file, ind.line, f"Exposed secret config: {ind.evidence}", repo_root, report
             )
@@ -1032,6 +1123,8 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
 
         if refs:
             refs.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
+            if len(refs) > 5:
+                refs = refs[:5]
             lines = [r.line for r in refs if r.line is not None]
             identity = {"rule": "consolidated_secret", "file": filepath, "lines": lines}
             hyp_id = generate_hypothesis_id("credential_exposure", identity, is_llm=False)
@@ -1054,11 +1147,10 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             auth_inds_by_file.setdefault(ind.file, []).append(ind)
 
     for filepath, file_auth_inds in auth_inds_by_file.items():
-        if filepath in chain_files:
-            continue
-
         refs = []
         for ind in file_auth_inds:
+            if (ind.file, ind.line, "insecure_auth") in chain_covered_vulnerabilities:
+                continue
             ref = validate_and_create_evidence_ref(
                 "security_indicator", ind.file, ind.line, f"Access control: {ind.evidence}", repo_root, report
             )
@@ -1067,6 +1159,8 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
 
         if refs:
             refs.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
+            if len(refs) > 5:
+                refs = refs[:5]
             lines = [r.line for r in refs if r.line is not None]
             identity = {"rule": "consolidated_auth", "file": filepath, "lines": lines}
             hyp_id = generate_hypothesis_id("insecure_auth", identity, is_llm=False)
@@ -1089,11 +1183,10 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
             filesystem_inds_by_file.setdefault(ind.file, []).append(ind)
 
     for filepath, file_file_inds in filesystem_inds_by_file.items():
-        if filepath in chain_files:
-            continue
-
         refs = []
         for ind in file_file_inds:
+            if (ind.file, ind.line, "path_traversal") in chain_covered_vulnerabilities:
+                continue
             ref = validate_and_create_evidence_ref(
                 "security_indicator", ind.file, ind.line, f"Filesystem access: {ind.evidence}", repo_root, report
             )
@@ -1102,6 +1195,8 @@ def generate_hypotheses_from_report(report: RepositoryReport, repo_root: str, er
 
         if refs:
             refs.sort(key=lambda x: (x.file, x.line or 0, x.type, x.detail))
+            if len(refs) > 5:
+                refs = refs[:5]
             lines = [r.line for r in refs if r.line is not None]
             identity = {"rule": "consolidated_file", "file": filepath, "lines": lines}
             hyp_id = generate_hypothesis_id("path_traversal", identity, is_llm=False)

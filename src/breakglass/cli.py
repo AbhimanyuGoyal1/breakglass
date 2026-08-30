@@ -50,7 +50,7 @@ def main():
         "--validator",
         choices=["mock", "local", "container", "trueforge"],
         default="mock",
-        help="Sandbox validator backend selection (default: mock)."
+        help="Sandbox validator backend selection (default: mock). Note: mock backend is for dry-runs and test fixtures, returning NOT_CONFIRMED by default unless pre-configured with predefined results."
     )
     parser.add_argument(
         "--max-hypotheses",
