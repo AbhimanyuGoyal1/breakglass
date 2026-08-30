@@ -164,8 +164,17 @@ def main():
         validation_results = []
         if args.validate:
             # Human-in-the-loop interactive approval gate
-            auto_approve = args.yes or os.environ.get("BREAKGLASS_AUTO_APPROVE") == "true" or not sys.stdin.isatty()
+            auto_approve = args.yes or os.environ.get("BREAKGLASS_AUTO_APPROVE") == "true"
             if not auto_approve:
+                if not sys.stdin.isatty():
+                    # Non-interactive (piped, redirected, CI, subprocess) without explicit approval:
+                    # fail closed — never implicitly approve validation in automated environments.
+                    print(
+                        "Error: Validation requires explicit approval via --yes or "
+                        "BREAKGLASS_AUTO_APPROVE=true in non-interactive mode.",
+                        file=sys.stderr
+                    )
+                    sys.exit(1)
                 print("=" * 60)
                 print(" HUMAN APPROVAL REQUIREMENT DETECTED")
                 print("=" * 60)
