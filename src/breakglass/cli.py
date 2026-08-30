@@ -91,6 +91,11 @@ def main():
         "--gemini-model",
         help="Specify Gemini model to use for LLM reasoning (overrides GEMINI_MODEL env var)."
     )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Auto-approve all validation prompts (useful for automated testing/scripts)."
+    )
 
     args = parser.parse_args()
 
@@ -153,9 +158,31 @@ def main():
                 print(f"     - [{ref.type}] {ref.file}{line_str} -> {ref.detail}")
         print()
 
+
+
         # 4. Validation Layer
         validation_results = []
         if args.validate:
+            # Human-in-the-loop interactive approval gate
+            auto_approve = args.yes or os.environ.get("BREAKGLASS_AUTO_APPROVE") == "true" or not sys.stdin.isatty()
+            if not auto_approve:
+                print("=" * 60)
+                print(" HUMAN APPROVAL REQUIREMENT DETECTED")
+                print("=" * 60)
+                print(f"BREAKGLASS generated {len(reasoning_report.hypotheses)} security hypotheses.")
+                print("Validation will run local verification tests inside an isolated sandbox.")
+                print("Do you approve executing this validation run? (yes/no): ", end="")
+                sys.stdout.flush()
+                try:
+                    user_input = sys.stdin.readline().strip().lower()
+                except Exception:
+                    user_input = "no"
+                if user_input not in ("yes", "y"):
+                    print("[-] Validation aborted by user approval constraint.")
+                    sys.exit(0)
+                print("[+] Approval granted. Initiating sandbox validation...")
+                print()
+
             if args.verbose:
                 print(f"[*] Initializing sandbox validator: {args.validator}...")
 

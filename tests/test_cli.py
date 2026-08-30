@@ -45,7 +45,7 @@ class TestCommandLineInterface(unittest.TestCase):
 
     def test_cli_validation_enabled(self):
         """Verify basic run with --validate successfully prints validation results."""
-        code, stdout, stderr = self.run_cli([self.sample_repo, "--validate", "--validator", "mock"])
+        code, stdout, stderr = self.run_cli([self.sample_repo, "--validate", "--validator", "mock", "--yes"])
         self.assertEqual(code, 0)
         self.assertIn("SANDBOX HYPOTHESIS VALIDATION RESULTS", stdout)
         self.assertIn("Status: NOT_CONFIRMED", stdout)
@@ -58,7 +58,8 @@ class TestCommandLineInterface(unittest.TestCase):
             code, stdout, stderr = self.run_cli([
                 self.sample_repo,
                 "--validate",
-                "--output", out_file
+                "--output", out_file,
+                "--yes"
             ])
             self.assertEqual(code, 0)
             self.assertTrue(os.path.exists(out_file))
