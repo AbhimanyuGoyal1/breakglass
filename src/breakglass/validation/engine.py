@@ -515,6 +515,18 @@ class ValidationEngine:
                         identity = identity_chain
                     else:
                         return False
+            elif hypothesis.category in ("xss", "ssti", "ssrf", "xxe", "deserialization", "open_redirect", "idor", "mass_assignment", "broken_auth", "nosql_injection"):
+                lines = sorted(list({r.line for r in canonical_references if r.line is not None}))
+                file_val = canonical_references[0].file if canonical_references else ""
+                has_auth = any("access control" in getattr(r, "detail", "").lower() or "session" in getattr(r, "detail", "").lower() or "authentication" in getattr(r, "detail", "").lower() for r in canonical_references)
+                
+                identity = {
+                    "rule": "attack_chain",
+                    "file": file_val,
+                    "category": hypothesis.category,
+                    "lines": lines,
+                    "has_auth": has_auth
+                }
             elif hypothesis.category == "insecure_dependency":
                 file_ref = next((r for r in canonical_references if r.type == "file"), None)
                 if not file_ref:
@@ -648,6 +660,7 @@ class ValidationEngine:
         supported_categories = {
             "command_injection",
             "sql_injection",
+            "nosql_injection",
             "remote_code_execution",
             "credential_exposure",
             "untrusted_input_execution",
@@ -662,6 +675,15 @@ class ValidationEngine:
             "dangerous_cicd",
             "infrastructure_misconfig",
             "network_exposure",
+            "xss",
+            "ssti",
+            "ssrf",
+            "xxe",
+            "deserialization",
+            "open_redirect",
+            "idor",
+            "mass_assignment",
+            "broken_auth"
         }
         if not isinstance(hypothesis.category, str) or hypothesis.category not in supported_categories:
             return False, f"Unsupported or invalid category: {hypothesis.category}"
