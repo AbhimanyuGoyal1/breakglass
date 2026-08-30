@@ -246,7 +246,7 @@ class TestCliValidatorSelectionOverrides(unittest.TestCase):
         mock_inspect.return_value = MagicMock()
         mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
         with patch.dict(os.environ, env_patches):
-            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'local']):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--yes', '--validator', 'local']):
                 try:
                     main()
                 except SystemExit:
@@ -265,7 +265,7 @@ class TestCliValidatorSelectionOverrides(unittest.TestCase):
         mock_inspect.return_value = MagicMock()
         mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
         with patch.dict(os.environ, env_patches):
-            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'container']):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--yes', '--validator', 'container']):
                 try:
                     main()
                 except SystemExit:
@@ -285,7 +285,7 @@ class TestCliValidatorSelectionOverrides(unittest.TestCase):
         mock_inspect.return_value = MagicMock()
         mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
         with patch.dict(os.environ, env_patches):
-            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'trueforge']):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--yes', '--validator', 'trueforge']):
                 try:
                     main()
                 except SystemExit:
@@ -303,7 +303,7 @@ class TestCliTimeoutPropagation(unittest.TestCase):
         """CLI local + timeout specified -> propagates to TrueForgeSandboxValidator"""
         mock_inspect.return_value = MagicMock()
         mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
-        with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'local', '--timeout', '120.0']):
+        with patch('sys.argv', ['breakglass', '.', '--validate', '--yes', '--validator', 'local', '--timeout', '120.0']):
             try:
                 main()
             except SystemExit:
@@ -317,7 +317,7 @@ class TestCliTimeoutPropagation(unittest.TestCase):
         """CLI container + timeout specified -> propagates to TrueForgeSandboxValidator"""
         mock_inspect.return_value = MagicMock()
         mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
-        with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'container', '--timeout', '120.0']):
+        with patch('sys.argv', ['breakglass', '.', '--validate', '--yes', '--validator', 'container', '--timeout', '120.0']):
             try:
                 main()
             except SystemExit:
@@ -333,7 +333,7 @@ class TestCliTimeoutPropagation(unittest.TestCase):
         mock_det.return_value.generate_hypotheses.return_value.hypotheses = []
         env_patches = {"TRUEFORGE_API_KEY": "test_key"}
         with patch.dict(os.environ, env_patches):
-            with patch('sys.argv', ['breakglass', '.', '--validate', '--validator', 'trueforge', '--timeout', '120.0']):
+            with patch('sys.argv', ['breakglass', '.', '--validate', '--yes', '--validator', 'trueforge', '--timeout', '120.0']):
                 try:
                     main()
                 except SystemExit:
@@ -892,6 +892,7 @@ class TestXXEDetectionRemediation(unittest.TestCase):
                 self.assertEqual(xxe_chains[0].evidence_references[-1].line, 5)
 
 
+
 class TestCLIApprovalGate(unittest.TestCase):
     """Regression tests verifying human-in-the-loop validation approval gate in cli.py."""
 
@@ -926,3 +927,118 @@ class TestCLIApprovalGate(unittest.TestCase):
             except SystemExit:
                 pass
             mock_validate.assert_called()
+
+
+class TestCLIApprovalGateSecurityBoundary(unittest.TestCase):
+    """Security boundary tests for the human-in-the-loop approval gate.
+
+    These tests verify observable security behavior: that denial genuinely
+    prevents validator construction/invocation, and that non-TTY without
+    explicit approval fails closed.
+    """
+
+    @patch("sys.stdin.isatty", return_value=True)
+    @patch("sys.stdin.readline", return_value="no\n")
+    @patch("breakglass.cli.ValidationEngine")
+    @patch("breakglass.cli.MockSandboxValidator")
+    @patch("breakglass.cli.TrueForgeSandboxValidator")
+    def test_denial_prevents_validator_construction(
+        self, mock_trueforge_cls, mock_mock_cls, mock_engine_cls, mock_readline, mock_isatty
+    ):
+        """TTY + 'no' -> SystemExit(0) and validator is NEVER constructed or invoked.
+
+        Qodo Finding #2: the real SystemExit must fire (not be mocked away),
+        and validation must provably not be reached.
+        """
+        from breakglass.cli import main
+        test_args = ["tests/fixtures/sample_repo", "--validate"]
+        with patch("sys.argv", ["breakglass"] + test_args):
+            with self.assertRaises(SystemExit) as cm:
+                main()
+        # Exit code 0 on user denial
+        self.assertEqual(cm.exception.code, 0)
+        # Validator was never constructed
+        mock_mock_cls.assert_not_called()
+        mock_trueforge_cls.assert_not_called()
+        # Validation engine was never constructed
+        mock_engine_cls.assert_not_called()
+
+    @patch("sys.stdin.isatty", return_value=True)
+    @patch("sys.stdin.readline", return_value="yes\n")
+    @patch("breakglass.cli.ValidationEngine")
+    def test_tty_yes_proceeds_validation(self, mock_engine_cls, mock_readline, mock_isatty):
+        """TTY + 'yes' -> validation engine is constructed and invoked."""
+        from breakglass.cli import main
+        mock_engine_instance = MagicMock()
+        mock_engine_instance.validate_hypotheses.return_value = []
+        mock_engine_cls.return_value = mock_engine_instance
+        test_args = ["tests/fixtures/sample_repo", "--validate"]
+        with patch("sys.argv", ["breakglass"] + test_args):
+            try:
+                main()
+            except SystemExit:
+                pass
+        mock_engine_cls.assert_called_once()
+        mock_engine_instance.validate_hypotheses.assert_called_once()
+
+    @patch("sys.stdin.isatty", return_value=False)
+    @patch("breakglass.cli.ValidationEngine")
+    @patch("breakglass.cli.MockSandboxValidator")
+    @patch("breakglass.cli.TrueForgeSandboxValidator")
+    def test_non_tty_without_approval_fails_closed(
+        self, mock_trueforge_cls, mock_mock_cls, mock_engine_cls, mock_isatty
+    ):
+        """Non-TTY without --yes or BREAKGLASS_AUTO_APPROVE -> exits with code 1, validation never reached.
+
+        Qodo Finding #1: non-TTY must NEVER implicitly approve. The gate must
+        fail closed (exit 1) before any validator is constructed or invoked.
+        """
+        from breakglass.cli import main
+        test_args = ["tests/fixtures/sample_repo", "--validate"]
+        clean_env = {k: v for k, v in os.environ.items() if k != "BREAKGLASS_AUTO_APPROVE"}
+        with patch.dict(os.environ, clean_env, clear=True):
+            with patch("sys.argv", ["breakglass"] + test_args):
+                with self.assertRaises(SystemExit) as cm:
+                    main()
+        # Must exit with code 1 (failure / fail-closed)
+        self.assertEqual(cm.exception.code, 1)
+        # Validator was never constructed
+        mock_mock_cls.assert_not_called()
+        mock_trueforge_cls.assert_not_called()
+        # Validation engine was never constructed
+        mock_engine_cls.assert_not_called()
+
+    @patch("sys.stdin.isatty", return_value=False)
+    @patch("breakglass.cli.ValidationEngine")
+    def test_yes_flag_approves_without_tty(self, mock_engine_cls, mock_isatty):
+        """--yes flag approves validation even in non-TTY (piped/CI) mode."""
+        from breakglass.cli import main
+        mock_engine_instance = MagicMock()
+        mock_engine_instance.validate_hypotheses.return_value = []
+        mock_engine_cls.return_value = mock_engine_instance
+        test_args = ["tests/fixtures/sample_repo", "--validate", "--yes"]
+        with patch("sys.argv", ["breakglass"] + test_args):
+            try:
+                main()
+            except SystemExit:
+                pass
+        mock_engine_cls.assert_called_once()
+        mock_engine_instance.validate_hypotheses.assert_called_once()
+
+    @patch("sys.stdin.isatty", return_value=False)
+    @patch("breakglass.cli.ValidationEngine")
+    def test_env_var_approves_without_tty(self, mock_engine_cls, mock_isatty):
+        """BREAKGLASS_AUTO_APPROVE=true approves validation even in non-TTY mode."""
+        from breakglass.cli import main
+        mock_engine_instance = MagicMock()
+        mock_engine_instance.validate_hypotheses.return_value = []
+        mock_engine_cls.return_value = mock_engine_instance
+        test_args = ["tests/fixtures/sample_repo", "--validate"]
+        with patch.dict(os.environ, {"BREAKGLASS_AUTO_APPROVE": "true"}):
+            with patch("sys.argv", ["breakglass"] + test_args):
+                try:
+                    main()
+                except SystemExit:
+                    pass
+        mock_engine_cls.assert_called_once()
+        mock_engine_instance.validate_hypotheses.assert_called_once()
