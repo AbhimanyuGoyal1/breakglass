@@ -25,6 +25,24 @@ def print_header(title: str):
 
 
 def main():
+    # Load environment variables from local .env file if it exists
+    dotenv_path = os.path.join(os.getcwd(), ".env")
+    if os.path.exists(dotenv_path):
+        try:
+            with open(dotenv_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and not os.environ.get(k):
+                            os.environ[k] = v
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(
         description="BREAKGLASS: Autonomous red-team security assessment and hypothesis validation agent."
     )
@@ -50,7 +68,7 @@ def main():
         "--validator",
         choices=["mock", "local", "container", "trueforge"],
         default="mock",
-        help="Sandbox validator backend selection (default: mock)."
+        help="Sandbox validator backend selection (default: mock). Note: mock backend is for dry-runs and test fixtures, returning NOT_CONFIRMED by default unless pre-configured with predefined results."
     )
     parser.add_argument(
         "--max-hypotheses",

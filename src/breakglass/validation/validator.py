@@ -56,6 +56,7 @@ class MockSandboxValidator(SandboxValidator):
         self.last_validated.append((hypothesis, repository_context))
         if hypothesis.id in self.predefined_results:
             return self.predefined_results[hypothesis.id]
+
         # Default fallback
         return ValidationResult(
             hypothesis_id=hypothesis.id,

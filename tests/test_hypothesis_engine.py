@@ -200,8 +200,8 @@ class TestSecurityHypothesisEngine(unittest.TestCase):
         )
         generator = SecurityHypothesisGenerator()
         res = generator.generate_and_rank(report, self.repo_root)
-        # Should gracefully generate 2 hypotheses despite the None finding
-        self.assertEqual(len(res.hypotheses), 2)
+        # Should gracefully generate 1 consolidated hypothesis despite the None finding
+        self.assertEqual(len(res.hypotheses), 1)
         self.assertEqual(res.validation_status, "partial_success")
 
     def test_hypothesis_deduplication(self):
