@@ -892,3 +892,37 @@ class TestXXEDetectionRemediation(unittest.TestCase):
                 self.assertEqual(xxe_chains[0].evidence_references[-1].line, 5)
 
 
+class TestCLIApprovalGate(unittest.TestCase):
+    """Regression tests verifying human-in-the-loop validation approval gate in cli.py."""
+
+    @patch("sys.stdin.isatty", return_value=True)
+    @patch("sys.stdin.readline")
+    @patch("sys.exit")
+    def test_approval_denied_aborts_validation(self, mock_exit, mock_readline, mock_isatty):
+        """Verify that typing 'no' aborts validation and calls sys.exit(0)."""
+        mock_readline.return_value = "no\n"
+        from breakglass.cli import main
+        # Force argparse to parse target path with --validate
+        test_args = ["tests/fixtures/sample_repo", "--validate"]
+        with patch("sys.argv", ["breakglass"] + test_args):
+            try:
+                main()
+            except SystemExit:
+                pass
+            mock_exit.assert_called_once_with(0)
+
+    @patch("sys.stdin.isatty", return_value=True)
+    @patch("sys.stdin.readline")
+    @patch("breakglass.validation.engine.ValidationEngine.validate_hypotheses")
+    def test_approval_granted_continues_validation(self, mock_validate, mock_readline, mock_isatty):
+        """Verify that typing 'yes' continues validation and invokes the validation engine."""
+        mock_readline.return_value = "yes\n"
+        mock_validate.return_value = []
+        from breakglass.cli import main
+        test_args = ["tests/fixtures/sample_repo", "--validate"]
+        with patch("sys.argv", ["breakglass"] + test_args):
+            try:
+                main()
+            except SystemExit:
+                pass
+            mock_validate.assert_called()
